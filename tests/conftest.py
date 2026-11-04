@@ -77,7 +77,7 @@ def external(monkeypatch):
         page = scraper.Page(url=HOMEPAGE, html=html, text="Acme makes widgets.")
         return [page], []
 
-    async def fake_extract(target, sources):
+    async def fake_extract(target, sources, deadline=None):
         fake.llm_calls += 1
         result = fake.llm_results.pop(0) if fake.llm_results else full_extraction()
         if isinstance(result, Exception):

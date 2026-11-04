@@ -63,6 +63,7 @@ script again. Filter or sort `results.csv` by `email` to see the runs side by si
 | A source fails or times out | 200, the run continues, the failure is listed in `errors` |
 | Time budget runs out | 200, with what was found so far and a `timeout:` entry in `errors` |
 | LLM call times out | 200, without LLM fields, with an `llm:` entry in `errors` |
+| Provider asks for a longer wait than the budget has left | 200, without LLM fields, with an `llm:` entry in `errors`; no more LLM calls |
 | LLM fails on the first extraction (bad key, refusal, retries used up) | 502 |
 | LLM fails on the retry extraction | 200, keeps the first extraction, with an `llm:` entry in `errors` |
 | Invalid email | 422 |
@@ -78,8 +79,9 @@ but no LLM fields, because those fields only come from the LLM.
 ### Rate limits
 
 LLM 429s and 5xx errors are retried with exponential backoff up to `LLM_MAX_RETRIES`, using the
-delay the provider asks for when it gives one (capped at `LLM_BACKOFF_MAX_SECONDS`). Retries stop
-when the time budget ends.
+delay the provider asks for when it gives one. `LLM_BACKOFF_MAX_SECONDS` caps only our own
+backoff, not the provider's delay. If that delay is longer than what is left of the time budget,
+such as a used-up daily quota, the run gives up at once rather than retrying.
 
 ### Cost
 

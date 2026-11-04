@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import re
+import time
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.exceptions import ModelAPIError, ModelRateLimitError
@@ -33,6 +34,10 @@ class LLMError(Exception):
 
 class LLMTimeoutError(LLMError):
     pass
+
+
+class LLMWaitTooLongError(LLMError):
+    """The provider asked for a longer wait than the run has left."""
 
 
 def build_chat_model(settings: Settings) -> BaseChatModel:
@@ -73,14 +78,21 @@ def _retry_after_seconds(exc: Exception) -> float | None:
             return float(header)
     except ValueError:
         pass
-    match = re.search(r"retry(?:Delay| in)\W{0,5}(\d+(?:\.\d+)?)\s*s", str(exc), re.IGNORECASE)
+    # Gemini writes "retry in 19h41m59.8s" in the message and "'retryDelay': '70919s'" in details.
+    text = str(exc)
+    match = re.search(r"retry in (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s", text, re.IGNORECASE)
+    if match:
+        hours, minutes, seconds = match.groups()
+        return int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds)
+    match = re.search(r"retryDelay\W{0,5}(\d+(?:\.\d+)?)s", text, re.IGNORECASE)
     return float(match.group(1)) if match else None
 
 
 def _backoff_seconds(attempt: int, exc: Exception, settings: Settings) -> float:
     delay = settings.llm_backoff_base_seconds * 2**attempt + random.uniform(0, 1)
-    delay = max(delay, _retry_after_seconds(exc) or 0)
-    return min(delay, settings.llm_backoff_max_seconds)
+    delay = min(delay, settings.llm_backoff_max_seconds)
+    # The cap is only for our own backoff: retrying before the provider's wait is over is wasted.
+    return max(delay, _retry_after_seconds(exc) or 0)
 
 
 def _cost_usd(usage: dict | None, settings: Settings) -> tuple[float, str | None]:
@@ -96,9 +108,12 @@ def _cost_usd(usage: dict | None, settings: Settings) -> tuple[float, str | None
 
 
 async def extract_facts(
-    target: str, sources: list[SourceDoc]
+    target: str, sources: list[SourceDoc], deadline: float | None = None
 ) -> tuple[ExtractionResult, float, str | None]:
-    """Return the extracted facts, the call's cost and an optional cost warning."""
+    """Return the extracted facts, the call's cost and an optional cost warning.
+
+    deadline is when the run's time budget ends, on the time.monotonic() clock.
+    """
     settings = get_settings()
     chain = build_chat_model(settings).with_structured_output(
         ExtractionResult, method="json_schema", include_raw=True
@@ -117,6 +132,14 @@ async def extract_facts(
             raise LLMTimeoutError(f"timed out after {settings.llm_timeout_seconds:g}s") from exc
         except (ModelRateLimitError, ModelAPIError) as exc:
             logger.warning("LLM attempt %d failed: %s", attempt + 1, exc)
+            requested = _retry_after_seconds(exc)
+            if deadline is not None and requested is not None:
+                remaining = max(deadline - time.monotonic(), 0)
+                if requested > remaining:
+                    raise LLMWaitTooLongError(
+                        f"gave up, provider asked to wait {requested:.0f}s "
+                        f"with {remaining:.0f}s left in the time budget"
+                    ) from exc
             if attempt == settings.llm_max_retries:
                 reason = "rate limited" if isinstance(exc, ModelRateLimitError) else "provider error"
                 raise LLMError(f"{reason} after {attempt + 1} attempts") from exc

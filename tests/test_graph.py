@@ -6,7 +6,7 @@ import pytest
 from app.agents.enrichment import drop_unsourced, is_free_email, parse_domain, run_enrichment
 from app.models.enrichment import EnrichRequest, Sourced, SourceDoc
 from app.services import scraper, tavily
-from app.services.llm import LLMError, LLMTimeoutError
+from app.services.llm import LLMError, LLMTimeoutError, LLMWaitTooLongError
 from tests.conftest import HOMEPAGE, SEARCH_URL, fact, full_extraction
 
 
@@ -295,6 +295,20 @@ async def test_llm_timeout_returns_partial_result(external):
     assert "llm: timed out after 15s" in lead.errors
     assert lead.domain.value == "acme.com"
     assert lead.company_name.value is None
+
+
+async def test_long_provider_wait_records_error_and_stops(external):
+    message = "gave up, provider asked to wait 70919s with 24s left in the time budget"
+    external.llm_results = [LLMWaitTooLongError(message)]
+
+    lead = await run_enrichment(request())
+
+    assert f"llm: {message}" in lead.errors
+    assert lead.domain.value == "acme.com"
+    assert [t.value for t in lead.tech_stack] == ["Shopify"]
+    # No targeted search and no second LLM call, which would only use up more quota.
+    assert external.llm_calls == 1
+    assert len(external.search_queries) == 2
 
 
 async def test_llm_failure_on_retry_keeps_first_extraction(external):

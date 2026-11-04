@@ -63,6 +63,8 @@ class EnrichState(TypedDict, total=False):
     extraction: ExtractionResult | None
     missing_fields: list[str]
     retries: int
+    deadline: float
+    llm_gave_up: bool
     sources: Annotated[list[SourceDoc], add]
     tech_stack: Annotated[list[Sourced], add]
     errors: Annotated[list[str], add]
@@ -236,7 +238,11 @@ async def extract(state: EnrichState) -> EnrichState:
 
     previous = state.get("extraction")
     try:
-        result, cost, warning = await llm.extract_facts(state["target"], sources)
+        result, cost, warning = await llm.extract_facts(
+            state["target"], sources, state.get("deadline")
+        )
+    except llm.LLMWaitTooLongError as exc:
+        return {"errors": [f"llm: {exc}"], "llm_gave_up": True}
     except llm.LLMTimeoutError as exc:
         return {"errors": [f"llm: {exc}"]}
     except llm.LLMError as exc:
@@ -279,6 +285,8 @@ def _route_after_resolve(state: EnrichState) -> list[str] | str:
 
 
 def _route_after_validate(state: EnrichState) -> str:
+    if state.get("llm_gave_up"):
+        return END
     if state["missing_fields"] and state.get("retries", 0) < 1:
         return "targeted_search"
     return END
@@ -350,6 +358,7 @@ async def run_enrichment(request: EnrichRequest) -> EnrichedLead:
         "email": request.email,
         "company_hint": request.company_hint,
         "retries": 0,
+        "deadline": time.monotonic() + settings.enrich_timeout_seconds,
         "sources": [],
         "tech_stack": [],
         "errors": [],

@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.llm import LLMError
+from app.services.llm import LLMError, LLMWaitTooLongError
 
 client = TestClient(app)
 
@@ -49,6 +49,15 @@ def test_invalid_email_returns_422(external):
 
 def test_missing_name_returns_422(external):
     assert client.post("/enrich", json={"email": "jo@acme.com"}).status_code == 422
+
+
+def test_long_provider_wait_returns_200_with_error(external):
+    external.llm_results = [LLMWaitTooLongError("gave up, provider asked to wait 70919s")]
+
+    response = post()
+
+    assert response.status_code == 200
+    assert "llm: gave up, provider asked to wait 70919s" in response.json()["errors"]
 
 
 def test_llm_failure_returns_502_with_provider(external):

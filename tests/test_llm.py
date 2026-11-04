@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 
 import pytest
 from langchain_anthropic import ChatAnthropic
@@ -213,6 +214,52 @@ def test_backoff_uses_retry_delay_field(settings):
     settings.llm_backoff_max_seconds = 60
     exc = ModelRateLimitError("details: {'retryDelay': '41s'}")
     assert llm._backoff_seconds(0, exc, settings) == 41
+
+
+def test_backoff_reads_hours_and_minutes_from_gemini_error(settings):
+    exc = ModelRateLimitError("Quota exceeded. Please retry in 19h41m59.5s.")
+    assert llm._retry_after_seconds(exc) == 19 * 3600 + 41 * 60 + 59.5
+
+
+def test_backoff_cap_does_not_shorten_the_providers_wait(settings):
+    settings.llm_backoff_max_seconds = 5
+    exc = ModelRateLimitError("Please retry in 12s.")
+    assert llm._backoff_seconds(0, exc, settings) == 12
+
+
+async def test_gives_up_at_once_when_wait_is_longer_than_budget(settings, monkeypatch):
+    calls = fake_network(
+        monkeypatch, "gemini", [ModelRateLimitError("Please retry in 19h41m59.5s.")]
+    )
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(llm.asyncio, "sleep", sleep)
+
+    with pytest.raises(llm.LLMWaitTooLongError, match=r"asked to wait 70920s with \d+s left"):
+        await llm.extract_facts("acme.com", SOURCES, deadline=time.monotonic() + 30)
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+async def test_waits_when_providers_wait_fits_the_budget(settings, monkeypatch):
+    calls = fake_network(
+        monkeypatch, "gemini", [ModelRateLimitError("Please retry in 2s."), valid_response()]
+    )
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(llm.asyncio, "sleep", sleep)
+
+    await llm.extract_facts("acme.com", SOURCES, deadline=time.monotonic() + 30)
+
+    assert len(calls) == 2
+    assert sleeps == [2]
 
 
 async def test_call_timeout_raises_timeout_error(settings, monkeypatch):
