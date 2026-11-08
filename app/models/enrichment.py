@@ -32,7 +32,7 @@ class Sourced(BaseModel):
     source_url: str | None = Field(description="Exact URL of the source stating the fact.")
     confidence: Confidence | None = Field(
         description="high: stated on the company's own site. medium: stated by a credible "
-        "third party. low: weak, indirect or outdated mention."
+        "third party. low: weak, indirect or outdated mention, or the sources disagree."
     )
 
     @model_validator(mode="after")
@@ -67,9 +67,11 @@ class ExtractionResult(BaseModel):
 
     company_name: Sourced
     website_summary: Sourced = Field(description="2-3 lines on what the company does.")
-    industry: Sourced
+    industry: Sourced = Field(description="From the company's own site when it says.")
     employee_range: EmployeeRangeFact
-    location: Sourced = Field(description="Headquarters location.")
+    location: list[Sourced] = Field(
+        description="Headquarters first. Add other offices only if the company's own site lists them."
+    )
     funding: Sourced = Field(
         description="Private funding rounds only (seed, Series A, etc.), as stated. Null for "
         "public or acquired companies."
@@ -85,7 +87,7 @@ class EnrichedLead(BaseModel):
     website_summary: Sourced = Field(default_factory=Sourced.empty)
     industry: Sourced = Field(default_factory=Sourced.empty)
     employee_range: Sourced = Field(default_factory=Sourced.empty)
-    location: Sourced = Field(default_factory=Sourced.empty)
+    location: list[Sourced] = []
     tech_stack: list[Sourced] = []
     funding: Sourced = Field(default_factory=Sourced.empty)
     recent_news: list[NewsItem] = []

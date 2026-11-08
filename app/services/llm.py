@@ -25,6 +25,11 @@ Rules:
 - If the sources do not state a fact, set its value, source_url and confidence to null.
 - source_url must be copied exactly from the source that states the fact.
 - Only use facts about the target company. Ignore other companies with similar names.
+- If the sources disagree about a field, give the best-supported value and set its confidence
+  to low. Several offices is not a disagreement.
+- industry: use how the company's own site describes its business. Only use a third-party
+  category label, such as LinkedIn's, if the company's own site does not say.
+- location: the headquarters first. Add other offices only if the company's own site lists them.
 - employee_range must be one of the allowed buckets. Use a stated size range or a stated total
   headcount. A count of profiles or followers on a site like LinkedIn is not a headcount.
 - funding is for private funding rounds only (seed, Series A, etc.). If the sources say the

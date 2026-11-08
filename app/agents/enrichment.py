@@ -40,40 +40,51 @@ SEARCH_PROVIDER_HOSTS = (
     "serpapi.com",
     "serper.dev",
 )
-# Company profile pages compiled by a third party. Facts cited from these are low confidence.
-AGGREGATOR_HOSTS = SEARCH_PROVIDER_HOSTS + (
-    "leadiq.com",
-    "zoominfo.com",
-    "crunchbase.com",
-    "pitchbook.com",
-    "cbinsights.com",
-    "tracxn.com",
-    "rocketreach.co",
-    "apollo.io",
-    "lusha.com",
-    "dnb.com",
-    "owler.com",
-    "globaldata.com",
-    "craft.co",
-    "growjo.com",
-    "signalhire.com",
-    "datanyze.com",
-    "theorg.com",
-)
-# Never the company's own site when looking up a website from a company name.
-NON_COMPANY_HOSTS = AGGREGATOR_HOSTS + (
+# The only third parties that can reach medium confidence. Any other site is low.
+TRUSTED_THIRD_PARTY_HOSTS = (
     "linkedin.com",
-    "facebook.com",
-    "instagram.com",
-    "x.com",
-    "twitter.com",
-    "youtube.com",
     "wikipedia.org",
+    "crunchbase.com",
+    "reuters.com",
     "bloomberg.com",
-    "glassdoor.com",
-    "indeed.com",
-    "yelp.com",
+    "wsj.com",
+    "nytimes.com",
+    "ft.com",
+    "forbes.com",
+    "techcrunch.com",
+    "cnbc.com",
+    "bbc.com",
+    "bbc.co.uk",
+    "apnews.com",
+    "economist.com",
+    "theguardian.com",
+    "washingtonpost.com",
+    "fortune.com",
+    "businessinsider.com",
+    "dawn.com",
+    "tribune.com.pk",
+    "thenews.com.pk",
+    "brecorder.com",
 )
+COMPANY_NAME_NOISE = {
+    "the",
+    "inc",
+    "incorporated",
+    "llc",
+    "ltd",
+    "limited",
+    "corp",
+    "corporation",
+    "co",
+    "company",
+    "plc",
+    "gmbh",
+    "pvt",
+    "pte",
+    "group",
+    "holdings",
+}
+DOMAIN_SUFFIX_LABELS = {"com", "co", "org", "net", "io", "ai", "app", "biz", "info"}
 KEY_FIELDS = ("industry", "employee_range")
 TARGETED_QUERY_TERMS = {
     "industry": "what the company does, industry sector",
@@ -133,11 +144,37 @@ def _host_in(host: str, domains: tuple[str, ...]) -> bool:
     return any(host == d or host.endswith(f".{d}") for d in domains)
 
 
+def _site_label(host: str) -> str:
+    """Return the name part of a host: 'stripe' for docs.stripe.co.uk."""
+    labels = host.split(".")
+    while len(labels) > 1 and (labels[-1] in DOMAIN_SUFFIX_LABELS or len(labels[-1]) == 2):
+        labels.pop()
+    return labels[-1].replace("-", "")
+
+
+def domain_matches_company(host: str, company: str) -> bool:
+    tokens = [t for t in re.findall(r"[a-z0-9]+", company.lower()) if t not in COMPANY_NAME_NOISE]
+    if not tokens:
+        return False
+    label = _site_label(host)
+    name = "".join(tokens)
+    return (
+        label == name
+        or (len(name) >= 3 and name in label)
+        or (len(label) >= 4 and name.startswith(label))
+        or (len(tokens) >= 2 and label == "".join(token[0] for token in tokens))
+    )
+
+
 async def _lookup_website(company: str) -> tuple[str | None, str | None]:
-    """Find a company's own website by name. Returns (domain, source URL)."""
+    """Find a company's own website by name. Returns (domain, source URL), or nulls if none fits."""
     for doc in await tavily.search(f"{company} official website"):
         host = (urlsplit(doc.url).hostname or "").removeprefix("www.")
-        if DOMAIN_RE.match(host) and not _host_in(host, NON_COMPANY_HOSTS):
+        if (
+            DOMAIN_RE.match(host)
+            and not _host_in(host, SEARCH_PROVIDER_HOSTS)
+            and domain_matches_company(host, company)
+        ):
             return host, doc.url
     return None, None
 
@@ -249,14 +286,18 @@ def drop_unsourced(
     return result.model_copy(update=update), dropped
 
 
+def _source_host(fact: Sourced) -> str:
+    return urlsplit(fact.source_url or "").hostname or ""
+
+
 def _capped_confidence(fact: Sourced, own_hosts: tuple[str, ...]) -> Confidence:
-    """High needs the company's own site, third parties reach medium, aggregators are low."""
-    host = urlsplit(fact.source_url or "").hostname or ""
+    """High needs the company's own site, trusted third parties reach medium, the rest are low."""
+    host = _source_host(fact)
     if _host_in(host, own_hosts):
         return fact.confidence or "low"
-    if _host_in(host, AGGREGATOR_HOSTS) or fact.confidence in (None, "low"):
-        return "low"
-    return "medium"
+    if _host_in(host, TRUSTED_THIRD_PARTY_HOSTS) and fact.confidence in ("high", "medium"):
+        return "medium"
+    return "low"
 
 
 def apply_confidence_rules(
@@ -272,6 +313,14 @@ def apply_confidence_rules(
         value = getattr(result, field)
         update[field] = [capped(fact) for fact in value] if isinstance(value, list) else capped(value)
     return result.model_copy(update=update)
+
+
+def keep_listed_offices(result: ExtractionResult, own_hosts: tuple[str, ...]) -> ExtractionResult:
+    """Several locations are only allowed when the company's own site lists them."""
+    if len(result.location) <= 1:
+        return result
+    own = [fact for fact in result.location if _host_in(_source_host(fact), own_hosts)]
+    return result.model_copy(update={"location": own if len(own) >= 2 else result.location[:1]})
 
 
 def _date_span(text: str) -> tuple[date, date] | None:
@@ -336,7 +385,8 @@ async def extract(state: EnrichState) -> EnrichState:
         return {"errors": [f"llm: {exc}"]}
 
     result, dropped = drop_unsourced(result, sources)
-    result = apply_confidence_rules(result, _own_hosts(state))
+    own_hosts = _own_hosts(state)
+    result = keep_listed_offices(apply_confidence_rules(result, own_hosts), own_hosts)
     today = date.today()
     recent = [item for item in result.recent_news if is_recent_news(item, today)]
     result = result.model_copy(update={"recent_news": recent})

@@ -1,6 +1,7 @@
 import asyncio
 import ipaddress
 import logging
+import random
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
@@ -16,6 +17,8 @@ FIRECRAWL_URL = "https://api.firecrawl.dev/v2/scrape"
 FIRECRAWL_TIMEOUT_SHARE = 0.6
 MAX_HTML_BYTES = 2_000_000
 MAX_REDIRECTS = 5
+SCRAPE_RETRY_DELAY_SECONDS = 1.0
+SCRAPE_RETRY_MAX_DELAY_SECONDS = 3.0
 USER_AGENT = "Mozilla/5.0 (compatible; SpeedToLeadBot/1.0)"
 
 
@@ -85,6 +88,27 @@ async def _fetch_direct(url: str) -> Page | None:
     raise ScrapeError(f"too many redirects from {url}")
 
 
+def _scrape_retry_delay(response: httpx.Response) -> float | None:
+    """Return how long to wait before retrying a 429, or None if it's too long to be worth it."""
+    delay = SCRAPE_RETRY_DELAY_SECONDS + random.uniform(0, 0.5)
+    retry_after = response.headers.get("retry-after", "")
+    if retry_after.isdigit():
+        delay = max(delay, float(retry_after))
+    return delay if delay <= SCRAPE_RETRY_MAX_DELAY_SECONDS else None
+
+
+async def _fetch_direct_with_retry(url: str) -> Page | None:
+    """Retry once after a short wait if the site answers 429."""
+    try:
+        return await _fetch_direct(url)
+    except httpx.HTTPStatusError as exc:
+        delay = _scrape_retry_delay(exc.response) if exc.response.status_code == 429 else None
+        if delay is None:
+            raise
+    await asyncio.sleep(delay)
+    return await _fetch_direct(url)
+
+
 async def _fetch_firecrawl(url: str, api_key: str, timeout: float) -> Page | None:
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
@@ -125,7 +149,7 @@ async def _fetch_page(domain: str, path: str) -> Page | None:
                 logger.warning("Firecrawl failed for %s, using httpx: %r", url, exc)
 
         try:
-            return await _fetch_direct(url)
+            return await _fetch_direct_with_retry(url)
         except httpx.TransportError:
             # Some sites only answer on the www host.
             return await _fetch_direct(f"https://www.{domain}{path}")

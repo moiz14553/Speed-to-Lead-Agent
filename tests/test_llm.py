@@ -144,6 +144,9 @@ async def test_prompt_has_todays_date_and_field_rules(settings, monkeypatch):
     assert "publicly traded or was acquired" in system.content
     assert "12 months" in system.content
     assert "not a headcount" in system.content
+    assert "disagree" in system.content
+    assert "category label" in system.content
+    assert "other offices" in system.content
 
 
 def test_employee_buckets_are_in_the_schema_sent_to_the_llm():

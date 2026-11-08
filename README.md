@@ -68,6 +68,10 @@ script again. Filter or sort `results.csv` by `email` to see the runs side by si
 | LLM fails on the retry extraction | 200, keeps the first extraction, with an `llm:` entry in `errors` |
 | Invalid email | 422 |
 
+### Scraping
+
+A site answering 429 gets one short retry, unless it asks for a wait longer than 3 seconds.
+
 ### Timeouts
 
 `ENRICH_TIMEOUT_SECONDS` (default 30) limits the whole run. Each source also has its own limit:
@@ -92,15 +96,17 @@ calls cut off by a timeout, because no token count comes back for them. A model 
 ### Never inventing data
 
 The LLM only sees the collected sources. Any fact citing a URL that was not collected is set to
-null and counted in `errors`. Search-provider and aggregator pages are never used as a company's
-website. Tech stack is detected from page HTML without the LLM. Each source
+null and counted in `errors`. Tech stack is detected from page HTML without the LLM. Each source
 is capped at `SOURCE_CHAR_LIMIT` characters before it reaches the LLM.
 
 ### Field rules
 
 | Field | Rule |
 |---|---|
-| any `confidence` | `high` only from the company's own domain; third parties reach `medium`; aggregator profile pages (Tavily, LeadIQ, CB Insights, etc.) are `low` |
+| any `confidence` | `high` only from the company's own domain. A short allowlist of trusted third parties (LinkedIn, Wikipedia, Crunchbase, major news sites) reaches `medium`. Every other site is `low`. If sources disagree on a field, `low` |
+| `domain` from a company name | Only a site whose domain plausibly matches the name, otherwise null. Search-provider pages are never used |
+| `industry` | From the company's own site when it says, before any third-party category label |
+| `location` | A list, headquarters first. More than one entry only when the company's own site lists them |
 | `employee_range` | One of `1-10`, `11-50`, `51-200`, `201-500`, `501-1000`, `1001-5000`, `5001-10000`, `10000+`, or null. Profile counts don't qualify |
 | `funding` | Private rounds only. Null for public or acquired companies, which `website_summary` mentions instead |
 | `recent_news` | About the company itself, with a date from the source, within the last 12 months |

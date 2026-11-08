@@ -20,10 +20,9 @@ SINGLE_FIELDS = [
     "website_summary",
     "industry",
     "employee_range",
-    "location",
     "funding",
 ]
-LIST_FIELDS = ["tech_stack", "recent_news"]
+LIST_FIELDS = ["location", "tech_stack", "recent_news"]
 COLUMNS = [
     "run_id",
     "llm_provider",

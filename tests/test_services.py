@@ -149,6 +149,81 @@ async def test_blocked_homepage_is_reported(monkeypatch, public_hosts):
     assert errors[0] == "scrape /: HTTP 403"
 
 
+async def _no_sleep(seconds):
+    return None
+
+
+async def test_scrape_429_is_retried_once_and_succeeds(monkeypatch, public_hosts):
+    monkeypatch.setattr(scraper.asyncio, "sleep", _no_sleep)
+    calls = []
+
+    def handler(request):
+        if request.url.path == "/about":
+            return httpx.Response(404)
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429)
+        return httpx.Response(200, html="<title>Home</title>")
+
+    _mock_transport(monkeypatch, handler)
+
+    pages, errors = await scraper.scrape_site("acme.com")
+
+    assert [page.url for page in pages] == ["https://acme.com/"]
+    assert errors == []
+    assert len(calls) == 2
+
+
+async def test_scrape_429_twice_is_reported_after_one_retry(monkeypatch, public_hosts):
+    monkeypatch.setattr(scraper.asyncio, "sleep", _no_sleep)
+    calls = []
+
+    def handler(request):
+        if request.url.path == "/about":
+            return httpx.Response(404)
+        calls.append(request)
+        return httpx.Response(429)
+
+    _mock_transport(monkeypatch, handler)
+
+    pages, errors = await scraper.scrape_site("acme.com")
+
+    assert pages == []
+    assert errors == ["scrape /: HTTP 429"]
+    assert len(calls) == 2
+
+
+async def test_scrape_429_with_long_retry_after_is_not_retried(monkeypatch, public_hosts):
+    calls = []
+
+    def handler(request):
+        if request.url.path == "/about":
+            return httpx.Response(404)
+        calls.append(request)
+        return httpx.Response(429, headers={"retry-after": "60"})
+
+    _mock_transport(monkeypatch, handler)
+
+    _, errors = await scraper.scrape_site("acme.com")
+
+    assert errors == ["scrape /: HTTP 429"]
+    assert len(calls) == 1
+
+
+async def test_scrape_403_is_not_retried(monkeypatch, public_hosts):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(403)
+
+    _mock_transport(monkeypatch, handler)
+
+    await scraper.scrape_site("acme.com")
+
+    assert len(calls) == 2
+
+
 async def test_redirect_to_private_host_is_blocked(monkeypatch, public_hosts):
     def handler(request):
         return httpx.Response(302, headers={"location": "http://internal.example.com/admin"})
@@ -288,6 +363,7 @@ def _lead_json(provider="gemini", model="gemini-3.8-flash") -> dict:
     fact = {"value": "x", "source_url": "https://a.com", "confidence": "high"}
     return {
         **{field: fact for field in enrich_script.SINGLE_FIELDS},
+        "location": [fact],
         "tech_stack": [fact, fact],
         "recent_news": [],
         "is_free_email": False,
@@ -319,6 +395,7 @@ def test_results_row_has_provider_model_and_sources():
     assert row["llm_provider"] == "anthropic"
     assert row["llm_model"] == "claude-haiku-5-5"
     assert row["industry_source"] == "https://a.com"
+    assert row["location_sources"] == "https://a.com"
     assert row["tech_stack"] == "x | x"
     assert row["errors"] == "one | two"
     assert set(row) <= set(enrich_script.COLUMNS)

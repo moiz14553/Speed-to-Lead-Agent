@@ -36,7 +36,7 @@ def full_extraction() -> ExtractionResult:
         website_summary=fact("Acme makes widgets."),
         industry=fact("Manufacturing"),
         employee_range=EmployeeRangeFact(value="51-200", source_url=HOMEPAGE, confidence="high"),
-        location=fact("Toronto"),
+        location=[fact("Toronto")],
         funding=fact("Series A", SEARCH_URL),
         recent_news=[news("Acme opens a new plant", SEARCH_URL)],
     )

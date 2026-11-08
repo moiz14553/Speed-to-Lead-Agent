@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.agents.enrichment import (
+    domain_matches_company,
     drop_unsourced,
     is_free_email,
     is_recent_news,
@@ -204,13 +205,13 @@ async def test_retries_at_most_once(external):
 
 async def test_second_extraction_does_not_lose_first_facts(external):
     second = without_key_fields().model_copy(
-        update={"location": Sourced.empty(), "recent_news": []}
+        update={"location": [], "recent_news": []}
     )
     external.llm_results = [without_key_fields(), second]
 
     lead = await run_enrichment(request())
 
-    assert lead.location.value == "Toronto"
+    assert lead.location[0].value == "Toronto"
     assert lead.recent_news[0].value == "Acme opens a new plant"
 
 
@@ -282,12 +283,14 @@ def test_drop_unsourced_removes_invented_urls():
 
 async def test_invented_source_is_nulled_and_reported(external):
     external.llm_results = [
-        full_extraction().model_copy(update={"location": fact("Paris", "https://invented.example")})
+        full_extraction().model_copy(
+            update={"location": [fact("Paris", "https://invented.example")]}
+        )
     ]
 
     lead = await run_enrichment(request())
 
-    assert lead.location == Sourced.empty()
+    assert lead.location == []
     assert any("dropped 1 fact" in error for error in lead.errors)
 
 
@@ -298,12 +301,16 @@ async def test_invented_source_is_nulled_and_reported(external):
         ("https://blog.acme.com/post", "high", "high"),
         ("https://acme.com/", "medium", "medium"),
         ("https://en.wikipedia.org/wiki/Acme", "high", "medium"),
-        ("https://www.linkedin.com/company/acme", "high", "medium"),
+        ("https://pk.linkedin.com/company/acme", "high", "medium"),
+        ("https://www.crunchbase.com/organization/acme", "high", "medium"),
+        ("https://www.reuters.com/business/acme", "high", "medium"),
+        ("https://www.dawn.com/news/1", "medium", "medium"),
         ("https://en.wikipedia.org/wiki/Acme", "low", "low"),
         ("https://tavily.com/knowledge/company/abc", "high", "low"),
         ("https://leadiq.com/c/acme/1", "medium", "low"),
-        ("https://www.cbinsights.com/company/acme", "high", "low"),
-        ("https://notacme.com/", "high", "medium"),
+        ("https://enrichlayer.com/company/acme", "high", "low"),
+        ("https://notacme.com/", "high", "low"),
+        ("https://wikipedia.org.evil.com/acme", "high", "low"),
     ],
 )
 async def test_confidence_depends_on_the_source(external, monkeypatch, url, given, expected):
@@ -313,19 +320,88 @@ async def test_confidence_depends_on_the_source(external, monkeypatch, url, give
     monkeypatch.setattr(tavily, "search", search)
     external.llm_results = [
         full_extraction().model_copy(
-            update={"location": Sourced(value="Toronto", source_url=url, confidence=given)}
+            update={"location": [Sourced(value="Toronto", source_url=url, confidence=given)]}
         )
     ]
 
     lead = await run_enrichment(request())
 
-    assert lead.location.confidence == expected
+    assert lead.location[0].confidence == expected
 
 
 async def test_news_confidence_is_capped_too(external):
     lead = await run_enrichment(request())
 
-    assert lead.recent_news[0].confidence == "medium"
+    assert lead.recent_news[0].confidence == "low"
+
+
+async def test_low_confidence_for_disagreeing_sources_is_kept_on_own_site(external):
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={"industry": Sourced(value="Widgets", source_url=HOMEPAGE, confidence="low")}
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.industry.confidence == "low"
+
+
+async def test_several_offices_are_kept_when_own_site_lists_them(external):
+    external.llm_results = [
+        full_extraction().model_copy(update={"location": [fact("Milton"), fact("Karachi")]})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Milton", "Karachi"]
+    assert all(office.confidence == "high" for office in lead.location)
+
+
+async def test_only_first_location_kept_when_not_from_own_site(external):
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={"location": [fact("Milton", SEARCH_URL), fact("Karachi", SEARCH_URL)]}
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Milton"]
+
+
+@pytest.mark.parametrize(
+    "host,company,expected",
+    [
+        ("stripe.com", "Stripe", True),
+        ("stripe.com", "Stripe, Inc.", True),
+        ("docs.stripe.com", "Stripe", True),
+        ("acme.co.uk", "Acme Ltd", True),
+        ("bankofamerica.com", "Bank of America", True),
+        ("daraz.pk", "Daraz Pakistan", True),
+        ("systemsltd.com", "Systems Limited", True),
+        ("ibm.com", "International Business Machines", True),
+        ("financer.com", "Stripe", False),
+        ("stripe.financer.com", "Stripe", False),
+        ("linkedin.com", "Stripe", False),
+        ("shopper.com", "HP", False),
+        ("example.com", "The Company", False),
+    ],
+)
+def test_domain_matches_company(host, company, expected):
+    assert domain_matches_company(host, company) is expected
+
+
+async def test_lookup_returns_null_when_no_site_matches_the_name(external, monkeypatch):
+    async def search(query, max_results=5):
+        return [SourceDoc(url="https://financer.com/stripe", text="Stripe review")]
+
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    assert lead.domain.value is None
+    assert external.scraped_domains == []
 
 
 @pytest.mark.parametrize(
