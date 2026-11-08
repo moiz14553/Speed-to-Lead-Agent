@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 
 from app.agents.enrichment import run_enrichment
 from app.config import get_settings
@@ -9,9 +9,11 @@ app = FastAPI(title="Speed-to-Lead Agent")
 
 
 @app.post("/enrich", response_model=EnrichedLead)
-async def enrich(request: EnrichRequest) -> EnrichedLead:
+async def enrich(
+    request: EnrichRequest, x_run_id: str | None = Header(default=None)
+) -> EnrichedLead:
     try:
-        return await run_enrichment(request)
+        return await run_enrichment(request, x_run_id)
     except LLMError as exc:
         settings = get_settings()
         raise HTTPException(

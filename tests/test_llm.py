@@ -181,6 +181,15 @@ def test_anthropic_does_not_send_temperature(settings):
     assert llm.build_chat_model(settings).temperature is None
 
 
+async def test_published_date_reaches_the_prompt(settings, monkeypatch):
+    calls = fake_network(monkeypatch, "gemini", [valid_response()])
+    source = SourceDoc(url="https://a.com", text="x", published_date="2026-10-01")
+
+    await llm.extract_facts("acme.com", [source])
+
+    assert '"published_date": "2026-10-01"' in calls[0]["messages"][1].content
+
+
 async def test_source_text_is_limited(settings, monkeypatch):
     settings.source_char_limit = 10
     calls = fake_network(monkeypatch, "gemini", [valid_response()])

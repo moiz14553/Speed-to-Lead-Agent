@@ -21,7 +21,7 @@ from app.models.enrichment import (
     Sourced,
     SourceDoc,
 )
-from app.services import llm, scraper, tavily
+from app.services import debug_store, llm, scraper, tavily
 from app.services.tech_detect import detect_tech
 
 FREE_EMAIL_RE = re.compile(
@@ -108,12 +108,31 @@ _OWNERSHIP_TEXT_RE = re.compile(
 _REPORT_URL_RE = re.compile(r"\.pdf($|\?)|annual[-_ ]?(%20)?report")
 MAX_LOCATIONS = 3
 LOOKUP_MAX_RESULTS = 10
+# On their own these say nothing about which company a page is about.
+GENERIC_NAME_WORDS = {
+    "systems",
+    "solutions",
+    "technologies",
+    "technology",
+    "software",
+    "services",
+    "digital",
+    "global",
+    "international",
+    "consulting",
+    "labs",
+    "media",
+    "data",
+}
+COMPACT_MATCH_MIN_LENGTH = 8
 DOMAIN_SUFFIX_LABELS = {"com", "co", "org", "net", "io", "ai", "app", "biz", "info"}
+RESEARCH_NODES = ["scrape_site", "search_company", "search_funding_news", "search_news"]
 KEY_FIELDS = ("industry", "employee_range")
 TARGETED_QUERY_TERMS = {
     "industry": "what the company does, industry sector",
     "employee_range": "number of employees, company size",
 }
+_SERVER_RUN_ID = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 SEARCH_ERRORS = (TimeoutError, httpx.HTTPError, tavily.TavilyError, ValueError)
 
 
@@ -126,6 +145,10 @@ class EnrichState(TypedDict, total=False):
     domain_source_url: str | None
     domain_confidence: Confidence
     homepage_url: str | None
+    site_name: str | None
+    dropped_sources: list[str]
+    lookup_results: list[SourceDoc]
+    raw_html: dict[str, str]
     target: str
     extraction: ExtractionResult | None
     missing_fields: list[str]
@@ -194,11 +217,12 @@ def domain_matches_company(host: str, company: str) -> bool:
     )
 
 
-async def _lookup_website(company: str) -> tuple[str | None, str | None]:
-    """Find a company's own website by name. Returns (domain, source URL), or nulls if none fits."""
+async def _lookup_website(company: str) -> tuple[str | None, str | None, list[SourceDoc]]:
+    """Find a company's website by name. Returns domain, source URL and the results searched."""
     best: tuple[tuple[bool, bool, int], str, str] | None = None
     name = "".join(_company_tokens(company))
-    for doc in await tavily.search(f"{company} official website", max_results=LOOKUP_MAX_RESULTS):
+    docs = await tavily.search(f"{company} official website", max_results=LOOKUP_MAX_RESULTS)
+    for doc in docs:
         host = (urlsplit(doc.url).hostname or "").removeprefix("www.")
         if (
             not DOMAIN_RE.match(host)
@@ -210,7 +234,7 @@ async def _lookup_website(company: str) -> tuple[str | None, str | None]:
         score = (_site_label(host) == name, host.endswith(".com"), -host.count("."))
         if best is None or score > best[0]:
             best = (score, host, doc.url)
-    return (best[1], best[2]) if best else (None, None)
+    return (best[1], best[2], docs) if best else (None, None, docs)
 
 
 async def resolve_domain(state: EnrichState) -> EnrichState:
@@ -240,13 +264,16 @@ async def resolve_domain(state: EnrichState) -> EnrichState:
 
     update: EnrichState = {"is_free_email": True, "target": hint, "domain_confidence": "medium"}
     try:
-        found, source_url = await _lookup_website(hint)
+        found, source_url, lookup_docs = await _lookup_website(hint)
     except SEARCH_ERRORS as exc:
         message = _describe_error(exc, settings.tavily_timeout_seconds)
         return {**update, "errors": [f"website lookup: {message}"]}
 
     update.update(
-        domain=found, domain_source_url=source_url, cost_usd=settings.tavily_cost_per_search_usd
+        domain=found,
+        domain_source_url=source_url,
+        lookup_results=lookup_docs,
+        cost_usd=settings.tavily_cost_per_search_usd,
     )
     if found:
         update["target"] = f"{hint} ({found})"
@@ -271,16 +298,18 @@ async def scrape_site(state: EnrichState) -> EnrichState:
     return {
         "sources": [SourceDoc(url=page.url, text=page.text) for page in pages],
         "homepage_url": pages[0].url if pages else None,
+        "site_name": next(filter(None, (scraper.page_site_name(p.html) for p in pages)), None),
+        "raw_html": {p.url: p.html for p in pages} if settings.debug_save_raw else {},
         "tech_stack": list(tech_stack.values()),
         "errors": errors,
         "cost_usd": firecrawl_pages * settings.firecrawl_cost_per_page_usd,
     }
 
 
-async def _run_search(label: str, query: str) -> EnrichState:
+async def _run_search(label: str, query: str, news: bool = False) -> EnrichState:
     settings = get_settings()
     try:
-        docs = await tavily.search(query)
+        docs = await (tavily.search_news if news else tavily.search)(query)
     except SEARCH_ERRORS as exc:
         message = _describe_error(exc, settings.tavily_timeout_seconds)
         return {"errors": [f"{label}: {message}"]}
@@ -293,8 +322,64 @@ async def search_company(state: EnrichState) -> EnrichState:
 
 
 async def search_funding_news(state: EnrichState) -> EnrichState:
-    query = f"{state['target']} funding round investors recent news"
+    query = f"{state['target']} funding round investors"
     return await _run_search("funding search", query)
+
+
+async def search_news(state: EnrichState) -> EnrichState:
+    return await _run_search("news search", f"{state['target']} news", news=True)
+
+
+def _name_phrases(name: str) -> list[list[str]]:
+    """Return the name as words, plus without a legal suffix when what remains is distinctive."""
+    words = re.findall(r"[a-z0-9]+", name.lower())
+    stripped = [word for word in words if word not in COMPANY_NAME_NOISE]
+    phrases = [words] if words else []
+    if stripped and stripped != words and not (
+        len(stripped) == 1 and stripped[0] in GENERIC_NAME_WORDS
+    ):
+        phrases.append(stripped)
+    return phrases
+
+
+def _whole_phrase_pattern(words: list[str]) -> re.Pattern:
+    body = r"[\s\-_.,]*".join(re.escape(word) for word in words)
+    return re.compile(rf"(?<![a-z0-9]){body}(?![a-z0-9])")
+
+
+def relevant_sources(state: EnrichState) -> tuple[list[SourceDoc], list[str]]:
+    """Split sources into those about this company and the URLs of those that are not."""
+    sources = state.get("sources") or []
+    domain = state.get("domain")
+    hint = (state.get("company_hint") or "").strip()
+    names = [state.get("site_name") or ""]
+    if hint and not parse_domain(hint):
+        names.append(hint)
+
+    patterns = [_whole_phrase_pattern(words) for name in names for words in _name_phrases(name)]
+    label = ""
+    if domain:
+        patterns.append(re.compile(re.escape(domain)))
+        label = _site_label(domain)
+        if len(label) >= 4:
+            patterns.append(_whole_phrase_pattern([label]))
+    if not patterns:
+        return sources, []
+
+    own_hosts = _own_hosts(state)
+
+    def is_relevant(doc: SourceDoc) -> bool:
+        if _host_in(urlsplit(doc.url).hostname or "", own_hosts):
+            return True
+        text = f"{doc.url} {doc.title or ''} {doc.text}".lower()
+        if any(pattern.search(text) for pattern in patterns):
+            return True
+        # kyliecosmetics.com should match a page that says "Kylie Cosmetics".
+        return len(label) >= COMPACT_MATCH_MIN_LENGTH and label in re.sub(r"[^a-z0-9]", "", text)
+
+    kept = [doc for doc in sources if is_relevant(doc)]
+    kept_urls = {doc.url for doc in kept}
+    return kept, list(dict.fromkeys(doc.url for doc in sources if doc.url not in kept_urls))
 
 
 def drop_unsourced(
@@ -460,9 +545,12 @@ def _merge_extractions(
 
 
 async def extract(state: EnrichState) -> EnrichState:
-    sources = state.get("sources") or []
+    sources, dropped_urls = relevant_sources(state)
     if not sources:
-        return {"errors": ["extract: skipped, no sources collected"]}
+        return {
+            "errors": ["extract: skipped, no sources about this company"],
+            "dropped_sources": dropped_urls,
+        }
 
     previous = state.get("extraction")
     try:
@@ -486,6 +574,7 @@ async def extract(state: EnrichState) -> EnrichState:
         errors.append(f"validate: dropped {dropped} fact(s) citing a URL that was not collected")
     return {
         "extraction": _clear_funding_unless_private(_merge_extractions(previous, result)),
+        "dropped_sources": dropped_urls,
         "cost_usd": cost,
         "errors": errors,
     }
@@ -517,7 +606,7 @@ async def targeted_search(state: EnrichState) -> EnrichState:
 def _route_after_resolve(state: EnrichState) -> list[str] | str:
     if state.get("stop"):
         return END
-    return ["scrape_site", "search_company", "search_funding_news"]
+    return RESEARCH_NODES
 
 
 def _route_after_validate(state: EnrichState) -> str:
@@ -534,6 +623,7 @@ def build_graph():
     graph.add_node("scrape_site", scrape_site)
     graph.add_node("search_company", search_company)
     graph.add_node("search_funding_news", search_funding_news)
+    graph.add_node("search_news", search_news)
     graph.add_node("extract", extract)
     graph.add_node("validate", validate)
     graph.add_node("targeted_search", targeted_search)
@@ -542,9 +632,9 @@ def build_graph():
     graph.add_conditional_edges(
         "resolve_domain",
         _route_after_resolve,
-        ["scrape_site", "search_company", "search_funding_news", END],
+        [*RESEARCH_NODES, END],
     )
-    graph.add_edge(["scrape_site", "search_company", "search_funding_news"], "extract")
+    graph.add_edge(RESEARCH_NODES, "extract")
     graph.add_edge("extract", "validate")
     graph.add_conditional_edges("validate", _route_after_validate, ["targeted_search", END])
     graph.add_edge("targeted_search", "extract")
@@ -612,7 +702,7 @@ def _build_lead(state: EnrichState, is_free: bool, latency_ms: int) -> EnrichedL
     )
 
 
-async def run_enrichment(request: EnrichRequest) -> EnrichedLead:
+async def run_enrichment(request: EnrichRequest, run_id: str | None = None) -> EnrichedLead:
     """Run the graph within the time budget. On timeout, return what was found so far."""
     settings = get_settings()
     start = time.perf_counter()
@@ -639,6 +729,9 @@ async def run_enrichment(request: EnrichRequest) -> EnrichedLead:
             f"timeout: stopped at the {settings.enrich_timeout_seconds:g}s budget, "
             "results are partial"
         ]
+    finally:
+        if settings.debug_save_raw:
+            debug_store.save_raw(run_id or _SERVER_RUN_ID, state)
 
     email_domain = request.email.rsplit("@", 1)[1].lower()
     is_free = state.get("is_free_email", is_free_email(email_domain))

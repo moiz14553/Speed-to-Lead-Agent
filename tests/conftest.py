@@ -80,16 +80,24 @@ def external(monkeypatch):
         scraped_domains: list[str] = []
         llm_calls = 0
         llm_results: list = []
+        news_queries: list[str] = []
+        llm_sources: list = []
 
     fake = External()
     fake.search_queries = []
     fake.scraped_domains = []
     fake.llm_calls = 0
     fake.llm_results = []
+    fake.news_queries = []
+    fake.llm_sources = []
 
     async def fake_search(query: str, max_results: int = 5):
         fake.search_queries.append(query)
         return [SourceDoc(url=SEARCH_URL, title="Acme news", text="Acme raised a Series A.")]
+
+    async def fake_search_news(query: str, max_results: int = 5):
+        fake.news_queries.append(query)
+        return []
 
     html = '<html><script src="https://cdn.shopify.com/s/app.js"></script>Acme</html>'
 
@@ -100,12 +108,14 @@ def external(monkeypatch):
 
     async def fake_extract(target, sources, deadline=None):
         fake.llm_calls += 1
+        fake.llm_sources.append(sources)
         result = fake.llm_results.pop(0) if fake.llm_results else full_extraction()
         if isinstance(result, Exception):
             raise result
         return result, 0.01, None
 
     monkeypatch.setattr(tavily, "search", fake_search)
+    monkeypatch.setattr(tavily, "search_news", fake_search_news)
     monkeypatch.setattr(scraper, "scrape_site", fake_scrape)
     monkeypatch.setattr("app.services.llm.extract_facts", fake_extract)
     return fake

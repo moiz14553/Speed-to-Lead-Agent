@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import importlib.util
+import json
 import socket
 from pathlib import Path
 
@@ -36,6 +37,20 @@ _spec.loader.exec_module(enrich_script)
 )
 def test_detects_signature(html, expected):
     assert expected in detect_tech(html)
+
+
+def test_detects_lazada_and_alibaba_platform():
+    html = (
+        '<script src="//g.lazcdn.com/g/mtb/lib-mtop/2.7.3/mtop.js"></script>'
+        "<script>var gq = (window.goldlog_queue || (window.goldlog_queue = []));</script>"
+        "<script>icon.href = 'https://img.alicdn.com/imgextra/i2/x.png'</script>"
+    )
+
+    detected = detect_tech(html)
+
+    assert "Lazada Platform" in detected
+    assert "Alibaba Aplus Analytics" in detected
+    assert "Alibaba CDN" in detected
 
 
 def test_facebook_sdk_alone_is_not_meta_pixel():
@@ -351,6 +366,51 @@ async def test_tavily_search_parses_results(monkeypatch):
     assert requests[0].headers["authorization"] == "Bearer test-tavily"
 
 
+async def test_tavily_news_search_requests_last_year_and_parses_dates(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "url": "https://a.com",
+                        "title": "A",
+                        "content": "News",
+                        "published_date": "Thu, 16 Apr 2026 16:14:59 GMT",
+                    },
+                    {"url": "https://b.com", "content": "No date", "published_date": None},
+                    {"url": "https://c.com", "content": "Bad", "published_date": "not a date"},
+                ]
+            },
+        )
+
+    _mock_transport(monkeypatch, handler)
+
+    docs = await tavily.search_news("acme news")
+
+    body = json.loads(requests[0].content)
+    assert body["topic"] == "news"
+    assert body["time_range"] == "year"
+    assert [doc.published_date for doc in docs] == ["2026-04-16", None, None]
+
+
+async def test_general_search_is_not_a_news_search(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"results": []})
+
+    _mock_transport(monkeypatch, handler)
+
+    await tavily.search("acme")
+
+    assert "topic" not in json.loads(requests[0].content)
+
+
 async def test_tavily_without_key_raises(settings):
     settings.tavily_api_key = None
 
@@ -384,6 +444,29 @@ def _lead_json(provider="gemini", model="gemini-3.8-flash") -> dict:
         "llm_model": model,
         "errors": ["one", "two"],
     }
+
+
+@pytest.mark.parametrize(
+    "bucket,expected",
+    [
+        ("1-10", "1 to 10"),
+        ("51-200", "51 to 200"),
+        ("5001-10000", "5001 to 10000"),
+        ("10000+", "10000+"),
+    ],
+)
+def test_employee_buckets_are_excel_safe_in_csv(bucket, expected):
+    lead = _lead_json()
+    lead["employee_range"] = {"value": bucket, "source_url": "https://a.com", "confidence": "low"}
+
+    assert enrich_script.to_columns(lead)["employee_range"] == expected
+
+
+def test_null_employee_bucket_stays_null_in_csv():
+    lead = _lead_json()
+    lead["employee_range"] = {"value": None, "source_url": None, "confidence": None}
+
+    assert enrich_script.to_columns(lead)["employee_range"] is None
 
 
 def test_results_row_has_news_confidence_and_dates():

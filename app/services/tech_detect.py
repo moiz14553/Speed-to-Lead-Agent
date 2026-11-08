@@ -22,6 +22,9 @@ SIGNATURES = {
     "Marketo": ["munchkin.marketo.net"],
     "Pardot": ["pi.pardot.com"],
     "Next.js": ["/_next/static/"],
+    "Lazada Platform": ["g.lazcdn.com", "mtop.lazada"],
+    "Alibaba Aplus Analytics": ["goldlog_queue", "aplus_queue", "aplus.js", "aplus_v2"],
+    "Alibaba CDN": ["g.alicdn.com", "img.alicdn.com"],
 }
 
 

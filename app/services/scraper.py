@@ -53,6 +53,12 @@ def html_to_text(html: str) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def page_site_name(html: str) -> str | None:
+    """Return the company's name as its own page declares it, if it does."""
+    meta = BeautifulSoup(html, "html.parser").find("meta", attrs={"property": "og:site_name"})
+    return (meta.get("content") or "").strip() or None if meta else None
+
+
 async def assert_public_host(host: str) -> None:
     """Domains come from user input, so never fetch private or internal addresses."""
     try:

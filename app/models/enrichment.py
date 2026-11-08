@@ -105,4 +105,5 @@ class SourceDoc(BaseModel):
 
     url: str
     title: str | None = None
+    published_date: str | None = None
     text: str

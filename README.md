@@ -4,7 +4,7 @@ Phase 1: the enrichment agent. `POST /enrich` takes a lead's email and returns w
 found about their company. Every fact includes its source URL and a confidence level.
 
 ```
-resolve_domain → scrape_site + search_company + search_funding_news (parallel)
+resolve_domain → scrape_site + search_company + search_funding_news + search_news (parallel)
                → extract → validate → (key fields missing, once) targeted_search → extract
 ```
 
@@ -52,7 +52,7 @@ python scripts/test_enrich.py
 ```
 
 Each run adds its rows to `results.csv`, with a `run_id`, `llm_provider` and `llm_model` on
-every row. To compare providers, change `LLM_PROVIDER` in `.env`, restart the server and run the
+every row. Employee buckets are written as `1 to 10` so Excel doesn't read them as dates. To compare providers, change `LLM_PROVIDER` in `.env`, restart the server and run the
 script again. Filter or sort `results.csv` by `email` to see the runs side by side.
 
 ## How the API behaves
@@ -98,6 +98,17 @@ calls cut off by a timeout, because no token count comes back for them. A model 
 The LLM only sees the collected sources. Any fact citing a URL that was not collected is set to
 null and counted in `errors`. Tech stack is detected from page HTML without the LLM. Each source
 is capped at `SOURCE_CHAR_LIMIT` characters before it reaches the LLM.
+
+### Relevance filter
+
+Before the LLM runs, search results that aren't about the company are dropped. A result stays if it
+is on the company's own site or mentions its domain, name or `og:site_name`.
+
+### Debugging misses
+
+Set `DEBUG_SAVE_RAW=true` to save everything each lead collected to `debug/<run_id>/<email>.json`:
+the website lookup results, every source (with whether the relevance filter kept it), page HTML, and what the LLM extracted.
+The folder is gitignored. `scripts/test_enrich.py` sends its `run_id` in the `X-Run-Id` header.
 
 ### Field rules
 

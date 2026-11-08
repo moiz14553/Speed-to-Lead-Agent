@@ -54,6 +54,9 @@ def to_columns(lead: dict) -> dict:
         row[field] = fact["value"]
         row[f"{field}_source"] = fact["source_url"]
         row[f"{field}_confidence"] = fact["confidence"]
+    if row["employee_range"]:
+        # Excel reads "1-10" as a date.
+        row["employee_range"] = row["employee_range"].replace("-", " to ")
     for field in LIST_FIELDS:
         row[field] = " | ".join(fact["value"] for fact in lead[field])
         row[f"{field}_sources"] = " | ".join(fact["source_url"] for fact in lead[field])
@@ -63,14 +66,14 @@ def to_columns(lead: dict) -> dict:
     return row
 
 
-def enrich_row(client: httpx.Client, url: str, lead: dict) -> dict:
+def enrich_row(client: httpx.Client, url: str, lead: dict, run_id: str) -> dict:
     payload = {
         "email": lead["email"],
         "name": lead["name"],
         "company_hint": lead.get("company_hint") or None,
     }
     try:
-        response = client.post(url, json=payload)
+        response = client.post(url, json=payload, headers={"X-Run-Id": run_id})
     except httpx.HTTPError as exc:
         return {"errors": f"request failed: {exc!r}"}
 
@@ -112,7 +115,7 @@ def main() -> None:
             writer.writeheader()
         for index, lead in enumerate(leads, start=1):
             print(f"[{index}/{len(leads)}] {lead['email']}")
-            row = enrich_row(client, args.url, lead)
+            row = enrich_row(client, args.url, lead, run_id)
             writer.writerow(
                 {
                     "run_id": run_id,

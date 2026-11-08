@@ -6,6 +6,7 @@ Manual review of the enrichment agent on 10 test leads.
 - **Reviewed:** 113 rows, one per lead per field, with one row per item for `location`, `tech_stack` and `recent_news`
 - **Blank verdicts skipped:** 0
 - **Scoring:** `correct` and `ok_null` both count as right
+- **Corrected after review:** Gymshark `location` changed from correct to wrong, and Daraz `ownership` from wrong to correct. These cancel out, so the totals did not change
 
 ## Results
 
@@ -18,8 +19,8 @@ Manual review of the enrichment agent on 10 test leads.
 Without the 10 rows for the Gmail lead with no hint, where there is nothing to look up, the score
 is 89 right of 103 (86.4%), 2 wrong (1.9%) and 12 missing (11.7%).
 
-Of the 89 rows that had a value, 85 are marked correct. By confidence: high 52 of 52, medium 7 of 7,
-low 26 of 30.
+Of the 89 rows that had a value, 85 are marked correct. By confidence: high 51 of 52, medium 7 of 7,
+low 27 of 30.
 
 ### By field
 
@@ -28,8 +29,8 @@ low 26 of 30.
 | domain | 10 | 9 (90%) | 0 | 1 (10%) |
 | industry | 10 | 9 (90%) | 0 | 1 (10%) |
 | employee_range | 10 | 8 (80%) | 0 | 2 (20%) |
-| location | 11 | 10 (91%) | 0 | 1 (9%) |
-| ownership | 10 | 7 (70%) | 1 (10%) | 2 (20%) |
+| location | 11 | 9 (82%) | 1 (9%) | 1 (9%) |
+| ownership | 10 | 8 (80%) | 0 | 2 (20%) |
 | funding | 10 | 3 (30%) | 0 | 7 (70%) |
 | website_summary | 10 | 9 (90%) | 0 | 1 (10%) |
 | tech_stack | 18 | 16 (89%) | 1 (6%) | 1 (6%) |
@@ -42,7 +43,7 @@ low 26 of 30.
 
 | Lead | Field | Value | Likely cause |
 |---|---|---|---|
-| info@daraz.pk | ownership | `acquired_by: Alibaba Group Holding Limited` | **Unresolved, not a sign of an invented value.** The collected data supports it: LinkedIn lists Alibaba as parent company, and CB Insights and Dealroom show an acquisition in May 2018. The same sources also call Daraz "Privately Held", so this may be a question of how to label a subsidiary. The model also cited a low-trust Tavily page when LinkedIn said the same thing. Needs the reviewer's reason. |
+| info@gymshark.com | location | New York, US (high confidence) | **LLM picked an office as the headquarters, and code let it through.** The company's page lists Solihull and New York without naming a headquarters. The rule preferring the company's own site then kept that value over Wikipedia's correct Solihull. |
 | info@daraz.pk | tech_stack | (empty) | **Detector gap in our code.** The HTML was fetched (431 KB, 16 script files), but the scripts come mostly from `g.lazcdn.com`, Alibaba/Lazada's own platform, and none of the 19 signatures match. |
 
 ## Missing rows
@@ -90,15 +91,15 @@ between runs, so this is a close approximation of what the model saw.
    this is the most probable source of future wrong values. Keep a result only if it mentions the
    company name or domain.
 3. **Extend tech detection.** Add signatures for the platforms that are currently missed, starting
-   with what Daraz loads. This is the one clear code error in the review, and it is low effort, but
-   affects few rows, so it ranks third.
+   with what Daraz loads. This is a clear code error and low effort, but it affects few rows, so it
+   ranks third.
+
+A further candidate is headquarters selection: don't mark an office as the headquarters unless a
+source says so (Gymshark `location`).
 
 ## Notes for the next review
 
 - **Rows that lower the score without being errors:** 16 of the 22 missing rows are expected nulls
   (the Gmail lead and rule-cleared funding) or flagged values. An `n/a` verdict would separate these.
-- **One verdict to re-check:** Gymshark `location` (New York) is marked correct at high confidence.
-  Its page lists Solihull and New York without naming a headquarters, and Wikipedia gives Solihull.
-  If this is wrong, the score is 88 right and 3 wrong, and headquarters selection becomes a candidate fix.
 - **Excel:** it turns `1-10` into a date and may re-save the file as tab-separated text.
 - **Sample size:** 10 leads and one reviewer, so treat these percentages as indicative.

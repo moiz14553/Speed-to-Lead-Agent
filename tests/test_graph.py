@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import date, timedelta
 
 import httpx
@@ -179,6 +180,222 @@ async def test_research_runs_in_parallel(external, monkeypatch, settings):
     lead = await run_enrichment(request())
 
     assert not any(error.startswith("timeout") for error in lead.errors)
+
+
+async def test_news_has_its_own_search(external):
+    await run_enrichment(request())
+
+    assert external.news_queries == ["acme.com news"]
+    funding_query = next(q for q in external.search_queries if "funding" in q)
+    assert "news" not in funding_query
+
+
+async def test_news_search_results_reach_the_llm(external, monkeypatch):
+    async def search_news(query, max_results=5):
+        return [
+            SourceDoc(
+                url="https://reuters.com/acme",
+                title="Acme expands",
+                published_date="2026-10-01",
+                text="Acme opened a plant.",
+            )
+        ]
+
+    monkeypatch.setattr(tavily, "search_news", search_news)
+
+    await run_enrichment(request())
+
+    doc = next(d for d in external.llm_sources[0] if d.url == "https://reuters.com/acme")
+    assert doc.published_date == "2026-10-01"
+
+
+async def test_failed_news_search_is_reported_and_run_continues(external, monkeypatch):
+    async def search_news(query, max_results=5):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(tavily, "search_news", search_news)
+
+    lead = await run_enrichment(request())
+
+    assert "news search: boom" in lead.errors
+    assert lead.company_name.value == "Acme"
+
+
+def _sources_for(*docs):
+    async def search(query, max_results=5):
+        return list(docs)
+
+    return search
+
+
+async def test_small_company_keeps_only_results_about_it(external, monkeypatch):
+    """Searches for a tiny company mostly come back about other companies."""
+    profile = SourceDoc(url="https://tavily.com/knowledge/company/x", text="Soapplai builds agents.")
+    unrelated_funding = SourceDoc(
+        url="https://multiples.vc/private-comps/approaching-ai",
+        text="Approaching.AI raised a $195M Series B in October 2026.",
+    )
+    unrelated_profile = SourceDoc(
+        url="https://www.cbinsights.com/company/edgar-dunn", text="Edgar Dunn raised a Series B."
+    )
+    monkeypatch.setattr(tavily, "search", _sources_for(profile, unrelated_funding, unrelated_profile))
+
+    await run_enrichment(request("info@soapplai.com"))
+
+    urls = {doc.url for doc in external.llm_sources[0]}
+    assert profile.url in urls
+    assert unrelated_funding.url not in urls
+    assert unrelated_profile.url not in urls
+
+
+async def test_llm_cannot_cite_a_dropped_source(external, monkeypatch):
+    unrelated = SourceDoc(url="https://other.example/x", text="Other Corp raised $5M.")
+    monkeypatch.setattr(tavily, "search", _sources_for(unrelated))
+    external.llm_results = [
+        full_extraction().model_copy(update={"funding": fact("$5M", "https://other.example/x")})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.funding.value is None
+    assert any("citing a URL that was not collected" in error for error in lead.errors)
+
+
+async def test_llm_is_skipped_when_nothing_is_about_the_company(external, monkeypatch):
+    async def scrape(domain):
+        return [], ["scrape /: HTTP 403"]
+
+    monkeypatch.setattr(scraper, "scrape_site", scrape)
+    monkeypatch.setattr(tavily, "search", _sources_for(SourceDoc(url="https://x.example", text="Other")))
+
+    lead = await run_enrichment(request())
+
+    assert external.llm_calls == 0
+    assert "extract: skipped, no sources about this company" in lead.errors
+
+
+async def test_site_name_counts_as_a_name_match(external, monkeypatch):
+    """systemsltd.com doesn't contain the words 'Systems Limited', but its og:site_name does."""
+    html = '<meta property="og:site_name" content="Systems Limited">'
+
+    async def scrape(domain):
+        return [scraper.Page(url="https://systemsltd.com/", html=html, text="Home")], []
+
+    doc = SourceDoc(url="https://pk.linkedin.com/company/x", text="Systems Limited is an IT firm.")
+    generic = SourceDoc(url="https://x.example", text="Our operating systems are limited to two.")
+    monkeypatch.setattr(scraper, "scrape_site", scrape)
+    monkeypatch.setattr(tavily, "search", _sources_for(doc, generic))
+
+    await run_enrichment(request("info@systemsltd.com"))
+
+    urls = {source.url for source in external.llm_sources[0]}
+    assert doc.url in urls
+    assert generic.url not in urls
+
+
+@pytest.mark.parametrize(
+    "email,hint,text,expected",
+    [
+        ("info@kyliecosmetics.com", None, "Kylie Cosmetics launched a palette.", True),
+        ("info@acme.com", None, "See acme.com for details.", True),
+        ("info@acme.com", None, "ACME widgets are great.", True),
+        ("info@acme.com", None, "Acme-branded widgets.", True),
+        ("info@stripe.com", None, "A pinstripe suit.", False),
+        ("info@acme.com", None, "An unrelated page.", False),
+        ("jo@gmail.com", "Stripe, Inc.", "Stripe launched a product.", True),
+        ("jo@acme.com", "Systems Limited", "Operating systems news.", False),
+    ],
+)
+async def test_relevance_matching(external, monkeypatch, email, hint, text, expected):
+    doc = SourceDoc(url="https://third.example/page", text=text)
+    monkeypatch.setattr(tavily, "search", _sources_for(doc))
+
+    await run_enrichment(request(email, hint))
+
+    assert any(s.url == doc.url for s in sum(external.llm_sources, [])) is expected
+
+
+async def test_own_site_is_always_kept(external):
+    await run_enrichment(request("info@acme.com"))
+
+    assert any(doc.url == HOMEPAGE for doc in external.llm_sources[0])
+
+
+async def test_debug_save_writes_collected_data(external, settings, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    settings.debug_save_raw = True
+    unrelated = SourceDoc(url="https://other.example/x", text="Other Corp.")
+    related = SourceDoc(url="https://news.example/acme", text="Acme news.")
+    monkeypatch.setattr(tavily, "search", _sources_for(unrelated, related))
+
+    await run_enrichment(request(), "run1")
+
+    data = json.loads((tmp_path / "debug" / "run1" / "jo@acme.com.json").read_text(encoding="utf-8"))
+    kept = {source["url"]: source["kept_by_relevance_filter"] for source in data["sources"]}
+    assert kept["https://other.example/x"] is False
+    assert kept["https://news.example/acme"] is True
+    assert "cdn.shopify.com" in data["raw_html"][HOMEPAGE]
+    assert data["extraction"]["company_name"]["value"] == "Acme"
+
+
+async def test_debug_save_includes_website_lookup_results(
+    external, settings, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    settings.debug_save_raw = True
+    monkeypatch.setattr(
+        tavily, "search", _sources_for(SourceDoc(url="https://financer.com/stripe", text="Review"))
+    )
+
+    await run_enrichment(request("jo@gmail.com", "Stripe"), "run1")
+
+    data = json.loads((tmp_path / "debug" / "run1" / "jo@gmail.com.json").read_text(encoding="utf-8"))
+    assert data["website_lookup"][0]["url"] == "https://financer.com/stripe"
+    assert data["domain"] is None
+
+
+async def test_debug_save_is_off_by_default(external, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    await run_enrichment(request(), "run1")
+
+    assert not (tmp_path / "debug").exists()
+
+
+async def test_debug_save_also_runs_when_llm_fails(external, settings, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    settings.debug_save_raw = True
+    external.llm_results = [LLMError("rate limited after 4 attempts")]
+
+    with pytest.raises(LLMError):
+        await run_enrichment(request(), "run1")
+
+    assert (tmp_path / "debug" / "run1" / "jo@acme.com.json").exists()
+
+
+@pytest.mark.parametrize("run_id", ["../../evil", "..", "a/b\\c"])
+async def test_debug_folder_cannot_escape_debug_dir(
+    external, settings, monkeypatch, tmp_path, run_id
+):
+    monkeypatch.chdir(tmp_path)
+    settings.debug_save_raw = True
+
+    await run_enrichment(request(), run_id)
+
+    debug_root = (tmp_path / "debug").resolve()
+    files = list(tmp_path.rglob("jo@acme.com.json"))
+    assert len(files) == 1
+    assert files[0].resolve().is_relative_to(debug_root)
+
+
+async def test_debug_save_failure_does_not_fail_the_run(external, settings, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    settings.debug_save_raw = True
+    (tmp_path / "debug").write_text("a file where the folder should go", encoding="utf-8")
+
+    lead = await run_enrichment(request(), "run1")
+
+    assert lead.company_name.value == "Acme"
 
 
 async def test_no_retry_when_key_fields_found(external):

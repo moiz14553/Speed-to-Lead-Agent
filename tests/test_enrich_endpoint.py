@@ -39,8 +39,20 @@ def test_reports_provider_and_model(external, settings):
 
 def test_cost_adds_llm_and_searches(external, settings):
     settings.tavily_cost_per_search_usd = 0.008
-    # Two searches at 0.008 plus one LLM call at 0.01 from the fake.
-    assert post().json()["cost_usd"] == 0.026
+    # Three searches at 0.008 plus one LLM call at 0.01 from the fake.
+    assert post().json()["cost_usd"] == 0.034
+
+
+def test_run_id_header_names_the_debug_folder(external, settings, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    settings.debug_save_raw = True
+
+    response = client.post(
+        "/enrich", json={"email": "jo@acme.com", "name": "Jo"}, headers={"X-Run-Id": "run-42"}
+    )
+
+    assert response.status_code == 200
+    assert (tmp_path / "debug" / "run-42" / "jo@acme.com.json").exists()
 
 
 def test_invalid_email_returns_422(external):

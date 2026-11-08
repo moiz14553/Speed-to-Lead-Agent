@@ -40,6 +40,8 @@ class Settings(BaseSettings):
 
     source_char_limit: int = 6000
 
+    debug_save_raw: bool = False
+
     @property
     def resolved_model(self) -> str:
         return self.llm_model or DEFAULT_MODELS[self.llm_provider]
