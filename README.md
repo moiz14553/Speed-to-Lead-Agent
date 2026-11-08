@@ -8,6 +8,23 @@ resolve_domain → scrape_site + search_company + search_funding_news + search_n
                → extract → validate → (key fields missing, once) targeted_search → extract
 ```
 
+## Phase 1 status: frozen
+
+Phase 1, the enrichment agent, is frozen as of 2026-11-08.
+
+**Accuracy: 86%.** In a manual review of 10 test leads, 89 of 103 fields were right, using
+`gemini-3.5-flash-lite`. This leaves out the 10 rows for a free email with no company hint, where
+there is nothing to look up. The review came before the news search, relevance filter and final
+lookup, headquarters and funding fixes, so those are not reflected in the figure. See
+[docs/phase1_accuracy.md](docs/phase1_accuracy.md).
+
+**Known limitations**
+
+- **News relevance:** some `recent_news` items are mainly about a partner or are light coverage, and
+  a date can be when the page was updated rather than when the news happened.
+- **Run-to-run variation:** the same lead can get different values between runs, such as `ownership`
+  or `employee_range`. Search rankings shift, and this Gemini model ignores the temperature setting.
+
 ## Setup
 
 Requires Python 3.12.
