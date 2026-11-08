@@ -125,7 +125,21 @@ GENERIC_NAME_WORDS = {
     "data",
 }
 COMPACT_MATCH_MIN_LENGTH = 8
-DOMAIN_SUFFIX_LABELS = {"com", "co", "org", "net", "io", "ai", "app", "biz", "info"}
+# Second-level suffixes, as in acme.co.uk and acme.com.pk.
+DOMAIN_SUFFIX_LABELS = {"com", "co", "org", "net", "ac", "gov", "edu"}
+_FUNDING_AMOUNT_RE = re.compile(
+    r"[$\u20ac\u00a3\u00a5\u20b9]\s?\d"
+    r"|\d[\d,.]*\s?(k|m|mn|b|bn|thousand|million|billion|crore|lakh)\b"
+    r"|\b(usd|eur|gbp|pkr|inr|rs)\.?\s?\d"
+    r"|\d\s?(usd|eur|gbp|pkr|inr)\b",
+    re.IGNORECASE,
+)
+_FUNDING_ROUND_RE = re.compile(
+    r"\b(pre-?seed|seed|angel|series\s+[a-z]|round|funding|raised|venture|private equity"
+    r"|growth equity|financing|investment)\b",
+    re.IGNORECASE,
+)
+_NOT_A_FUNDING_ROUND_RE = re.compile(r"secondary|tender offer|post-?ipo|\bgrant\b", re.IGNORECASE)
 RESEARCH_NODES = ["scrape_site", "search_company", "search_funding_news", "search_news"]
 KEY_FIELDS = ("industry", "employee_range")
 TARGETED_QUERY_TERMS = {
@@ -194,7 +208,9 @@ def _host_in(host: str, domains: tuple[str, ...]) -> bool:
 def _site_label(host: str) -> str:
     """Return the name part of a host: 'stripe' for docs.stripe.co.uk."""
     labels = host.split(".")
-    while len(labels) > 1 and (labels[-1] in DOMAIN_SUFFIX_LABELS or len(labels[-1]) == 2):
+    if len(labels) > 1:
+        labels.pop()
+    while len(labels) > 1 and labels[-1] in DOMAIN_SUFFIX_LABELS:
         labels.pop()
     return labels[-1].replace("-", "")
 
@@ -217,24 +233,48 @@ def domain_matches_company(host: str, company: str) -> bool:
     )
 
 
-async def _lookup_website(company: str) -> tuple[str | None, str | None, list[SourceDoc]]:
-    """Find a company's website by name. Returns domain, source URL and the results searched."""
+def _has_preferred_tld(host: str) -> bool:
+    """True for .com and two-letter country endings, false for ones like .dev or .shop."""
+    ending = host.rsplit(".", 1)[-1]
+    return ending == "com" or len(ending) == 2
+
+
+async def _lookup_website(
+    company: str,
+) -> tuple[str | None, str | None, list[SourceDoc], int]:
+    """Find a company's website by name.
+
+    Returns the domain, its source URL, the results searched and how many searches ran. The
+    second query only runs if the first finds no exact name match on a preferred ending.
+    """
     best: tuple[tuple[bool, bool, int], str, str] | None = None
     name = "".join(_company_tokens(company))
-    docs = await tavily.search(f"{company} official website", max_results=LOOKUP_MAX_RESULTS)
-    for doc in docs:
-        host = (urlsplit(doc.url).hostname or "").removeprefix("www.")
-        if (
-            not DOMAIN_RE.match(host)
-            or _host_in(host, SEARCH_PROVIDER_HOSTS)
-            or not domain_matches_company(host, company)
-        ):
-            continue
-        # stripe.com beats stripe.dev, which beats stripepayments.com. First result wins ties.
-        score = (_site_label(host) == name, host.endswith(".com"), -host.count("."))
-        if best is None or score > best[0]:
-            best = (score, host, doc.url)
-    return (best[1], best[2], docs) if best else (None, None, docs)
+    docs: list[SourceDoc] = []
+    searches = 0
+    for query in (f"{company} official website", f"{company} company homepage"):
+        try:
+            results = await tavily.search(query, max_results=LOOKUP_MAX_RESULTS)
+        except SEARCH_ERRORS:
+            if searches == 0:
+                raise
+            break
+        searches += 1
+        docs += results
+        for doc in results:
+            host = (urlsplit(doc.url).hostname or "").removeprefix("www.")
+            if (
+                not DOMAIN_RE.match(host)
+                or _host_in(host, SEARCH_PROVIDER_HOSTS)
+                or not domain_matches_company(host, company)
+            ):
+                continue
+            # stripe.com beats stripe.dev, which beats stripepayments.com. First result wins ties.
+            score = (_site_label(host) == name, _has_preferred_tld(host), -host.count("."))
+            if best is None or score > best[0]:
+                best = (score, host, doc.url)
+        if best and best[0][:2] == (True, True):
+            break
+    return (best[1], best[2], docs, searches) if best else (None, None, docs, searches)
 
 
 async def resolve_domain(state: EnrichState) -> EnrichState:
@@ -264,7 +304,7 @@ async def resolve_domain(state: EnrichState) -> EnrichState:
 
     update: EnrichState = {"is_free_email": True, "target": hint, "domain_confidence": "medium"}
     try:
-        found, source_url, lookup_docs = await _lookup_website(hint)
+        found, source_url, lookup_docs, searches = await _lookup_website(hint)
     except SEARCH_ERRORS as exc:
         message = _describe_error(exc, settings.tavily_timeout_seconds)
         return {**update, "errors": [f"website lookup: {message}"]}
@@ -273,7 +313,7 @@ async def resolve_domain(state: EnrichState) -> EnrichState:
         domain=found,
         domain_source_url=source_url,
         lookup_results=lookup_docs,
-        cost_usd=settings.tavily_cost_per_search_usd,
+        cost_usd=searches * settings.tavily_cost_per_search_usd,
     )
     if found:
         update["target"] = f"{hint} ({found})"
@@ -436,11 +476,34 @@ def apply_confidence_rules(
     return result.model_copy(update=update)
 
 
-def _pick_locations(locations: list[Sourced], own_hosts: tuple[str, ...]) -> list[Sourced]:
-    """Use the company's own site if it gives any, otherwise only the first location."""
-    usable = [f for f in locations if not _REPORT_URL_RE.search((f.source_url or "").lower())]
+def _same_place(first: str, second: str) -> bool:
+    a, b = first.lower(), second.lower()
+    return a.split(",")[0].strip() in b or b.split(",")[0].strip() in a
+
+
+def _pick_locations(
+    locations: list[Sourced], headquarters: Sourced, own_hosts: tuple[str, ...]
+) -> list[Sourced]:
+    """Put a headquarters named by the company or Wikipedia first, then the company's offices."""
+    host = _source_host(headquarters)
+    has_hq = headquarters.value is not None
+    named_hq = has_hq and _host_in(host, (*own_hosts, "wikipedia.org"))
+    pool = [headquarters, *locations] if has_hq and not named_hq else locations
+
+    usable = [f for f in pool if not _REPORT_URL_RE.search((f.source_url or "").lower())]
     own = [fact for fact in usable if _host_in(_source_host(fact), own_hosts)]
-    return own[:MAX_LOCATIONS] if own else usable[:1]
+    picked = own if own else usable[:1]
+    if not named_hq:
+        return picked[:MAX_LOCATIONS]
+    others = [fact for fact in picked if not _same_place(fact.value, headquarters.value)]
+    return [headquarters, *others][:MAX_LOCATIONS]
+
+
+def is_funding_round(value: str | None) -> bool:
+    """A usable funding value names a private round or total raised, and has an amount."""
+    if not value or _NOT_A_FUNDING_ROUND_RE.search(value):
+        return False
+    return bool(_FUNDING_AMOUNT_RE.search(value) and _FUNDING_ROUND_RE.search(value))
 
 
 def _count_value(number: str, unit: str | None) -> float:
@@ -481,11 +544,13 @@ def _without_ownership_text(summary: Sourced) -> Sourced:
 def apply_field_rules(result: ExtractionResult, own_hosts: tuple[str, ...]) -> ExtractionResult:
     update: dict = {
         "website_summary": _without_ownership_text(result.website_summary),
-        "location": _pick_locations(result.location, own_hosts),
+        "location": _pick_locations(result.location, result.headquarters, own_hosts),
         "recent_news": [item for item in result.recent_news if is_recent_news(item, date.today())],
     }
     if employee_bucket(result.employee_count.value) is None:
         update["employee_count"] = Sourced.empty()
+    if not is_funding_round(result.funding.value):
+        update["funding"] = Sourced.empty()
 
     # "Own site" has to be true of the URL, not just the field the LLM put it in.
     own_industry = result.own_site_industry
@@ -674,7 +739,13 @@ def _lead_fields(extraction: ExtractionResult | None) -> dict:
     count = extraction.employee_count
     return {
         **extraction.model_dump(
-            exclude={"own_site_industry", "third_party_industry", "employee_count", "ownership"}
+            exclude={
+                "own_site_industry",
+                "third_party_industry",
+                "employee_count",
+                "ownership",
+                "headquarters",
+            }
         ),
         "industry": _resolved_industry(extraction),
         "employee_range": Sourced(

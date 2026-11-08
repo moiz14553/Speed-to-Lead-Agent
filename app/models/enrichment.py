@@ -73,9 +73,16 @@ class ExtractionResult(BaseModel):
     employee_count: Sourced = Field(
         description="Headcount text exactly as stated, e.g. '120' or '1,001-5,000 employees'."
     )
+    headquarters: Sourced = Field(
+        description="Only where a source explicitly names the headquarters. Never inferred from "
+        "a list of offices. Prefer the company's own site or Wikipedia."
+    )
     location: list[Sourced] = Field(description="Headquarters first, then up to 2 other offices.")
     ownership: OwnershipFact
-    funding: Sourced = Field(description="Private funding rounds (seed, Series A, etc.), as stated.")
+    funding: Sourced = Field(
+        description="A private funding round or total raised, with its amount, e.g. "
+        "'Series B, $20M' or 'Total raised: $50M'. Null if no amount is stated."
+    )
     recent_news: list[NewsItem] = Field(
         description="Up to 5 news items about the company itself from the last 12 months."
     )

@@ -40,8 +40,9 @@ def full_extraction() -> ExtractionResult:
         ownership=OwnershipFact(
             value="private", acquired_by=None, source_url=HOMEPAGE, confidence="high"
         ),
+        headquarters=Sourced.empty(),
         location=[fact("Toronto")],
-        funding=fact("Series A", SEARCH_URL),
+        funding=fact("Series A, $5M", SEARCH_URL),
         recent_news=[news("Acme opens a new plant", SEARCH_URL)],
     )
 

@@ -115,12 +115,12 @@ The folder is gitignored. `scripts/test_enrich.py` sends its `run_id` in the `X-
 | Field | Rule |
 |---|---|
 | any `confidence` | `high` only from the company's own domain. A short allowlist of trusted third parties (LinkedIn, Wikipedia, Crunchbase, major news sites) reaches `medium`. Every other site is `low`. If sources disagree on a field, `low` |
-| `domain` from a company name | Picks the search result whose domain best matches the name, preferring an exact `.com`. Null if none matches. Search-provider pages are never used |
+| `domain` from a company name | Picks the search result whose domain best matches the name, preferring an exact match on `.com` or a country ending. A second search runs if the first finds no such match. Null if none matches. Search-provider pages are never used |
 | `industry` | The company's own description of what it sells, before any third-party label |
-| `location` | A list, headquarters first, at most 3 entries. The company's own site is preferred, and annual-report branch lists are ignored |
+| `location` | A list, at most 3 entries. A headquarters named by the company's own site or Wikipedia comes first, then the company's own offices. Annual-report branch lists are ignored |
 | `employee_range` | The LLM extracts the raw headcount text and code maps it to `1-10`, `11-50`, `51-200`, `201-500`, `501-1000`, `1001-5000`, `5001-10000` or `10000+`. Profile counts don't qualify |
 | `ownership` | `private`, `public` or `acquired_by: X`, with its own source. Not repeated in `website_summary` |
-| `funding` | Private rounds only. Code sets it to null when `ownership` is public or acquired |
+| `funding` | A private round or total raised, with an amount; anything else is null. Code also sets it to null when `ownership` is public or acquired |
 | `recent_news` | About the company itself, with a date from the source, within the last 12 months |
 
 ## Tests

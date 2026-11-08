@@ -146,6 +146,8 @@ async def test_prompt_has_todays_date_and_field_rules(settings, monkeypatch):
     assert "disagree" in system.content
     assert "own_site_industry" in system.content
     assert "annual reports" in system.content
+    assert "explicitly names the headquarters" in system.content
+    assert "Secondary sales" in system.content
     assert "Never who owns it" in system.content
 
 

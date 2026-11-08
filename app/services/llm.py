@@ -29,13 +29,16 @@ Rules:
   to low. Several offices is not a disagreement.
 - own_site_industry: a short phrase for what the company sells, taken from its own site.
   third_party_industry: a category given by a third party, such as LinkedIn's label.
+- headquarters: only where a source explicitly names the headquarters, preferring the
+  company's own site or Wikipedia. A list of offices does not say which one is the headquarters.
 - location: the headquarters first, at most 3 entries. Prefer the company's own contact page,
   about page or footer. Ignore lists of branch addresses in annual reports.
 - employee_count: copy the headcount text as stated. A count of profiles or followers on a
   site like LinkedIn is not a headcount.
 - ownership: private, public or acquired, only if the sources say so. Give acquired_by if stated.
 - website_summary: only what the company does. Never who owns it, stock listings or acquisitions.
-- funding: private funding rounds only (seed, Series A, etc.).
+- funding: a private funding round or total raised, with its amount, such as 'Series B, $20M'.
+  Null if no amount is stated. Secondary sales and tender offers are not funding rounds.
 - recent_news only has items from the 12 months before today's date, each with its date (use
   a source's published_date when the text gives none), and
   only about the company itself. Leave out news about companies it invested in, partners'

@@ -11,6 +11,7 @@ from app.agents.enrichment import (
     drop_unsourced,
     employee_bucket,
     is_free_email,
+    is_funding_round,
     is_recent_news,
     parse_domain,
     run_enrichment,
@@ -582,6 +583,122 @@ async def test_several_offices_are_kept_when_own_site_lists_them(external):
     assert all(office.confidence == "high" for office in lead.location)
 
 
+WIKI = "https://en.wikipedia.org/wiki/Acme"
+
+
+def _wiki_collected(monkeypatch, url=WIKI):
+    monkeypatch.setattr(tavily, "search", _sources_for(SourceDoc(url=url, text="Acme profile")))
+
+
+async def test_wikipedia_headquarters_comes_before_an_own_site_office(external, monkeypatch):
+    """Gymshark: its page lists New York, while Wikipedia names Solihull as the headquarters."""
+    _wiki_collected(monkeypatch)
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={
+                "headquarters": fact("Solihull, England", WIKI),
+                "location": [fact("New York, US")],
+            }
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Solihull, England", "New York, US"]
+    assert lead.location[0].confidence == "medium"
+
+
+async def test_own_site_headquarters_comes_first_without_a_duplicate(external):
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={
+                "headquarters": fact("Toronto"),
+                "location": [fact("Karachi"), fact("Toronto, Canada")],
+            }
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Toronto", "Karachi"]
+
+
+async def test_headquarters_counts_towards_the_limit_of_three(external):
+    offices = [fact(city) for city in ("Karachi", "Lahore", "Dubai")]
+    external.llm_results = [
+        full_extraction().model_copy(update={"headquarters": fact("Toronto"), "location": offices})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Toronto", "Karachi", "Lahore"]
+
+
+async def test_headquarters_from_other_site_does_not_beat_own_offices(external, monkeypatch):
+    profile = "https://tavily.com/knowledge/company/abc"
+    _wiki_collected(monkeypatch, profile)
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={"headquarters": fact("Oxnard", profile), "location": [fact("Toronto")]}
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Toronto"]
+
+
+async def test_headquarters_from_other_site_used_when_nothing_else(external, monkeypatch):
+    profile = "https://tavily.com/knowledge/company/abc"
+    _wiki_collected(monkeypatch, profile)
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={"headquarters": fact("Oxnard", profile), "location": []}
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Oxnard"]
+    assert lead.location[0].confidence == "low"
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("Series B, $20M", True),
+        ("Series A $5 million", True),
+        ("Total raised: $9.419B", True),
+        ("Raised 50 million euros", True),
+        ("Seed round of 2 crore", True),
+        ("Private equity round, GBP 200M", True),
+        ("Secondary Market - V", False),
+        ("Series I", False),
+        ("Seed", False),
+        ("$261.73M", False),
+        ("Secondary sale, $500M", False),
+        ("Tender offer at $159B valuation, funding employees", False),
+        ("Post-IPO funding, $10M", False),
+        ("Grant funding, $20.9M", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_funding_round(value, expected):
+    assert is_funding_round(value) is expected
+
+
+@pytest.mark.parametrize("value", ["Secondary Market - V", "Series I"])
+async def test_funding_without_a_round_and_amount_is_null(external, value):
+    external.llm_results = [
+        full_extraction().model_copy(update={"funding": fact(value, SEARCH_URL)})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.funding.value is None
+
+
 async def test_at_most_three_locations(external):
     offices = [fact(city) for city in ("Toronto", "Karachi", "Lahore", "Dubai", "London")]
     external.llm_results = [full_extraction().model_copy(update={"location": offices})]
@@ -652,6 +769,12 @@ async def test_only_first_location_kept_when_not_from_own_site(external):
         ("daraz.pk", "Daraz Pakistan", True),
         ("systemsltd.com", "Systems Limited", True),
         ("ibm.com", "International Business Machines", True),
+        ("stripe.dev", "Stripe", True),
+        ("acme.shop", "Acme", True),
+        ("acme.store", "Acme Ltd", True),
+        ("acme.com.pk", "Acme", True),
+        ("acme.io", "Acme", True),
+        ("stripe.financer.dev", "Stripe", False),
         ("financer.com", "Stripe", False),
         ("stripe.financer.com", "Stripe", False),
         ("linkedin.com", "Stripe", False),
@@ -683,6 +806,102 @@ async def test_lookup_finds_exact_match_past_other_results(external, monkeypatch
 
     assert lead.domain.value == "stripe.com"
     assert external.scraped_domains == ["stripe.com"]
+
+
+def _lookup_search(first, second, queries):
+    """Fake search that answers the two lookup queries, and nothing else."""
+
+    async def search(query, max_results=5):
+        queries.append(query)
+        if "official website" in query:
+            return [SourceDoc(url=url, text="Stripe") for url in first]
+        if "company homepage" in query:
+            if isinstance(second, Exception):
+                raise second
+            return [SourceDoc(url=url, text="Stripe") for url in second]
+        return []
+
+    return search
+
+
+async def test_second_lookup_query_finds_com_over_dev(external, monkeypatch):
+    """Tavily can rank stripe.com out of the first query, leaving only stripe.dev."""
+    queries = []
+    search = _lookup_search(
+        ["https://tavily.com/knowledge/company/a", "https://stripe.dev/"],
+        ["https://blog.mean.ceo/x", "https://stripe.com/"],
+        queries,
+    )
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    assert lead.domain.value == "stripe.com"
+    assert any("company homepage" in query for query in queries)
+
+
+async def test_second_lookup_query_runs_when_first_finds_nothing(external, monkeypatch):
+    queries = []
+    search = _lookup_search(["https://financer.com/x"], ["https://stripe.com/"], queries)
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    assert lead.domain.value == "stripe.com"
+
+
+async def test_second_lookup_query_is_skipped_after_a_strong_match(external, monkeypatch):
+    queries = []
+    search = _lookup_search(["https://stripe.com/"], ["https://other.com/"], queries)
+    monkeypatch.setattr(tavily, "search", search)
+
+    await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    assert not any("company homepage" in query for query in queries)
+
+
+async def test_country_tld_counts_as_a_strong_match(external, monkeypatch):
+    queries = []
+    search = _lookup_search(["https://stripe.pk/"], ["https://stripe.com/"], queries)
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    assert lead.domain.value == "stripe.pk"
+    assert not any("company homepage" in query for query in queries)
+
+
+async def test_other_tld_is_used_when_nothing_better_exists(external, monkeypatch):
+    queries = []
+    search = _lookup_search(["https://stripe.dev/"], ["https://financer.com/x"], queries)
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    assert lead.domain.value == "stripe.dev"
+
+
+async def test_failed_second_lookup_keeps_first_result(external, monkeypatch):
+    queries = []
+    search = _lookup_search(["https://stripe.dev/"], httpx.ConnectError("boom"), queries)
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    assert lead.domain.value == "stripe.dev"
+    assert not any("website lookup" in error for error in lead.errors)
+
+
+async def test_lookup_charges_for_each_search(external, monkeypatch, settings):
+    settings.tavily_cost_per_search_usd = 1
+    queries = []
+    search = _lookup_search(["https://financer.com/x"], ["https://financer.com/y"], queries)
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    # Two lookups, company, funding, news and the targeted retry; no LLM call without sources.
+    assert lead.cost_usd == 6
 
 
 async def test_lookup_falls_back_to_a_partial_name_match(external, monkeypatch):
@@ -823,7 +1042,7 @@ async def test_funding_kept_unless_public_or_acquired(external, value):
 
     lead = await run_enrichment(request())
 
-    assert lead.funding.value == "Series A"
+    assert lead.funding.value == "Series A, $5M"
 
 
 async def test_funding_cleared_when_only_the_first_extraction_found_ownership(external):
