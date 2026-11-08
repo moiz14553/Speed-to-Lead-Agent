@@ -95,7 +95,7 @@ between runs, so this is a close approximation of what the model saw.
 
 ## Notes for the next review
 
-- **Rows that lower the score without being errors:** 15 of the 22 missing rows are expected nulls
+- **Rows that lower the score without being errors:** 16 of the 22 missing rows are expected nulls
   (the Gmail lead and rule-cleared funding) or flagged values. An `n/a` verdict would separate these.
 - **One verdict to re-check:** Gymshark `location` (New York) is marked correct at high confidence.
   Its page lists Solihull and New York without naming a headquarters, and Wikipedia gives Solihull.
