@@ -1,8 +1,16 @@
+from datetime import date
+
 import pytest
 from pydantic import SecretStr
 
 from app.config import Settings, get_settings
-from app.models.enrichment import ExtractionResult, Sourced, SourceDoc
+from app.models.enrichment import (
+    EmployeeRangeFact,
+    ExtractionResult,
+    NewsItem,
+    Sourced,
+    SourceDoc,
+)
 from app.services import scraper, tavily
 
 HOMEPAGE = "https://acme.com/"
@@ -13,15 +21,24 @@ def fact(value: str, url: str = HOMEPAGE) -> Sourced:
     return Sourced(value=value, source_url=url, confidence="high")
 
 
+def news(value: str, url: str = HOMEPAGE, published: str | None = None) -> NewsItem:
+    return NewsItem(
+        value=value,
+        source_url=url,
+        confidence="high",
+        published_date=published or date.today().isoformat(),
+    )
+
+
 def full_extraction() -> ExtractionResult:
     return ExtractionResult(
         company_name=fact("Acme"),
         website_summary=fact("Acme makes widgets."),
         industry=fact("Manufacturing"),
-        employee_range=fact("51-200"),
+        employee_range=EmployeeRangeFact(value="51-200", source_url=HOMEPAGE, confidence="high"),
         location=fact("Toronto"),
         funding=fact("Series A", SEARCH_URL),
-        recent_news=[fact("Acme opens a new plant", SEARCH_URL)],
+        recent_news=[news("Acme opens a new plant", SEARCH_URL)],
     )
 
 

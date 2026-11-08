@@ -92,8 +92,18 @@ calls cut off by a timeout, because no token count comes back for them. A model 
 ### Never inventing data
 
 The LLM only sees the collected sources. Any fact citing a URL that was not collected is set to
-null and counted in `errors`. Tech stack is detected from page HTML without the LLM. Each source
+null and counted in `errors`. Search-provider and aggregator pages are never used as a company's
+website. Tech stack is detected from page HTML without the LLM. Each source
 is capped at `SOURCE_CHAR_LIMIT` characters before it reaches the LLM.
+
+### Field rules
+
+| Field | Rule |
+|---|---|
+| any `confidence` | `high` only from the company's own domain; third parties reach `medium`; aggregator profile pages (Tavily, LeadIQ, CB Insights, etc.) are `low` |
+| `employee_range` | One of `1-10`, `11-50`, `51-200`, `201-500`, `501-1000`, `1001-5000`, `5001-10000`, `10000+`, or null. Profile counts don't qualify |
+| `funding` | Private rounds only. Null for public or acquired companies, which `website_summary` mentions instead |
+| `recent_news` | About the company itself, with a date from the source, within the last 12 months |
 
 ## Tests
 

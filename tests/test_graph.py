@@ -1,13 +1,21 @@
 import asyncio
+from datetime import date, timedelta
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
-from app.agents.enrichment import drop_unsourced, is_free_email, parse_domain, run_enrichment
-from app.models.enrichment import EnrichRequest, Sourced, SourceDoc
+from app.agents.enrichment import (
+    drop_unsourced,
+    is_free_email,
+    is_recent_news,
+    parse_domain,
+    run_enrichment,
+)
+from app.models.enrichment import EmployeeRangeFact, EnrichRequest, Sourced, SourceDoc
 from app.services import scraper, tavily
 from app.services.llm import LLMError, LLMTimeoutError, LLMWaitTooLongError
-from tests.conftest import HOMEPAGE, SEARCH_URL, fact, full_extraction
+from tests.conftest import HOMEPAGE, SEARCH_URL, fact, full_extraction, news
 
 
 def request(email="jo@acme.com", hint=None) -> EnrichRequest:
@@ -82,6 +90,41 @@ async def test_free_email_with_name_hint_looks_up_website(external, monkeypatch)
     assert lead.domain.confidence == "medium"
     assert external.scraped_domains == ["acme.com"]
     assert "official website" in external.search_queries[0]
+
+
+@pytest.mark.parametrize(
+    "not_a_website",
+    [
+        "https://tavily.com/knowledge/company/abc",
+        "https://www.tavily.com/",
+        "https://leadiq.com/c/acme/123",
+        "https://www.cbinsights.com/company/acme",
+    ],
+)
+async def test_lookup_never_uses_search_or_aggregator_pages(external, monkeypatch, not_a_website):
+    async def search(query, max_results=5):
+        return [
+            SourceDoc(url=not_a_website, text="Acme profile"),
+            SourceDoc(url="https://acme.com/", text="Acme home"),
+        ]
+
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Acme Inc"))
+
+    assert lead.domain.value == "acme.com"
+
+
+async def test_lookup_with_only_search_pages_finds_no_domain(external, monkeypatch):
+    async def search(query, max_results=5):
+        return [SourceDoc(url="https://tavily.com/knowledge/company/abc", text="Acme profile")]
+
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Acme Inc"))
+
+    assert lead.domain.value is None
+    assert external.scraped_domains == []
 
 
 async def test_free_email_with_free_domain_as_hint_stops(external):
@@ -222,8 +265,8 @@ def test_drop_unsourced_removes_invented_urls():
         update={
             "industry": fact("Made up", "https://invented.example/"),
             "recent_news": [
-                fact("Real", SEARCH_URL),
-                fact("Fake", "https://invented.example/news"),
+                news("Real", SEARCH_URL),
+                news("Fake", "https://invented.example/news"),
             ],
         }
     )
@@ -246,6 +289,97 @@ async def test_invented_source_is_nulled_and_reported(external):
 
     assert lead.location == Sourced.empty()
     assert any("dropped 1 fact" in error for error in lead.errors)
+
+
+@pytest.mark.parametrize(
+    "url,given,expected",
+    [
+        ("https://acme.com/", "high", "high"),
+        ("https://blog.acme.com/post", "high", "high"),
+        ("https://acme.com/", "medium", "medium"),
+        ("https://en.wikipedia.org/wiki/Acme", "high", "medium"),
+        ("https://www.linkedin.com/company/acme", "high", "medium"),
+        ("https://en.wikipedia.org/wiki/Acme", "low", "low"),
+        ("https://tavily.com/knowledge/company/abc", "high", "low"),
+        ("https://leadiq.com/c/acme/1", "medium", "low"),
+        ("https://www.cbinsights.com/company/acme", "high", "low"),
+        ("https://notacme.com/", "high", "medium"),
+    ],
+)
+async def test_confidence_depends_on_the_source(external, monkeypatch, url, given, expected):
+    async def search(query, max_results=5):
+        return [SourceDoc(url=url, text="About Acme")]
+
+    monkeypatch.setattr(tavily, "search", search)
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={"location": Sourced(value="Toronto", source_url=url, confidence=given)}
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.location.confidence == expected
+
+
+async def test_news_confidence_is_capped_too(external):
+    lead = await run_enrichment(request())
+
+    assert lead.recent_news[0].confidence == "medium"
+
+
+@pytest.mark.parametrize(
+    "bucket", ["1-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5001-10000", "10000+"]
+)
+def test_employee_buckets_are_accepted(bucket):
+    assert EmployeeRangeFact(value=bucket, source_url=HOMEPAGE, confidence="low").value == bucket
+
+
+@pytest.mark.parametrize("value", ["158,337", "5", "5,001 to 10,000", "10,001+", "13651"])
+def test_other_employee_values_are_rejected(value):
+    with pytest.raises(ValidationError):
+        EmployeeRangeFact(value=value, source_url=HOMEPAGE, confidence="low")
+
+
+TODAY = date(2026, 11, 8)
+
+
+@pytest.mark.parametrize(
+    "published,expected",
+    [
+        ("2026-11-08", True),
+        ("2026-01-15", True),
+        ("2025-11-08", True),
+        ("2025-11", True),
+        ("2025-11-07", False),
+        ("2025-10", False),
+        ("2019-11-01", False),
+        ("2026-11-09", False),
+        ("2026-12", False),
+        ("2026", False),
+        ("October", False),
+        (None, False),
+    ],
+)
+def test_news_must_be_dated_within_12_months(published, expected):
+    item = news("Item").model_copy(update={"published_date": published})
+
+    assert is_recent_news(item, TODAY) is expected
+
+
+async def test_old_and_undated_news_is_removed(external):
+    old = (date.today() - timedelta(days=500)).isoformat()
+    undated = news("Undated", SEARCH_URL).model_copy(update={"published_date": None})
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={"recent_news": [news("Old", SEARCH_URL, old), undated, news("New", SEARCH_URL)]}
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [item.value for item in lead.recent_news] == ["New"]
+    assert lead.recent_news[0].published_date == date.today().isoformat()
 
 
 async def test_budget_runout_returns_what_was_found(external, monkeypatch, settings):

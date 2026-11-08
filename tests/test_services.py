@@ -299,6 +299,20 @@ def _lead_json(provider="gemini", model="gemini-3.8-flash") -> dict:
     }
 
 
+def test_results_row_has_news_confidence_and_dates():
+    lead = _lead_json()
+    lead["recent_news"] = [
+        {"value": "a", "source_url": "https://a.com", "confidence": "medium", "published_date": "2026-10-01"},
+        {"value": "b", "source_url": "https://b.com", "confidence": "low", "published_date": "2026-09"},
+    ]
+
+    row = enrich_script.to_columns(lead)
+
+    assert row["recent_news_confidences"] == "medium | low"
+    assert row["recent_news_dates"] == "2026-10-01 | 2026-09"
+    assert set(row) <= set(enrich_script.COLUMNS)
+
+
 def test_results_row_has_provider_model_and_sources():
     row = enrich_script.to_columns(_lead_json("anthropic", "claude-haiku-5-5"))
 

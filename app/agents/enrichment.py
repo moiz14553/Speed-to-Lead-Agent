@@ -1,6 +1,8 @@
 import asyncio
+import calendar
 import re
 import time
+from datetime import date, timedelta
 from operator import add
 from typing import Annotated, TypedDict
 from urllib.parse import urlsplit
@@ -14,6 +16,7 @@ from app.models.enrichment import (
     EnrichedLead,
     EnrichRequest,
     ExtractionResult,
+    NewsItem,
     Sourced,
     SourceDoc,
 )
@@ -25,8 +28,40 @@ FREE_EMAIL_RE = re.compile(
     r"|(yahoo|outlook|hotmail)\.(com|[a-z]{2}|co\.[a-z]{2}|com\.[a-z]{2}))$"
 )
 DOMAIN_RE = re.compile(r"^([a-z0-9-]+\.)+[a-z]{2,}$")
+SEARCH_PROVIDER_HOSTS = (
+    "tavily.com",
+    "google.com",
+    "bing.com",
+    "duckduckgo.com",
+    "yahoo.com",
+    "brave.com",
+    "perplexity.ai",
+    "exa.ai",
+    "serpapi.com",
+    "serper.dev",
+)
+# Company profile pages compiled by a third party. Facts cited from these are low confidence.
+AGGREGATOR_HOSTS = SEARCH_PROVIDER_HOSTS + (
+    "leadiq.com",
+    "zoominfo.com",
+    "crunchbase.com",
+    "pitchbook.com",
+    "cbinsights.com",
+    "tracxn.com",
+    "rocketreach.co",
+    "apollo.io",
+    "lusha.com",
+    "dnb.com",
+    "owler.com",
+    "globaldata.com",
+    "craft.co",
+    "growjo.com",
+    "signalhire.com",
+    "datanyze.com",
+    "theorg.com",
+)
 # Never the company's own site when looking up a website from a company name.
-DIRECTORY_HOSTS = (
+NON_COMPANY_HOSTS = AGGREGATOR_HOSTS + (
     "linkedin.com",
     "facebook.com",
     "instagram.com",
@@ -34,13 +69,10 @@ DIRECTORY_HOSTS = (
     "twitter.com",
     "youtube.com",
     "wikipedia.org",
-    "crunchbase.com",
     "bloomberg.com",
     "glassdoor.com",
     "indeed.com",
-    "zoominfo.com",
     "yelp.com",
-    "pitchbook.com",
 )
 KEY_FIELDS = ("industry", "employee_range")
 TARGETED_QUERY_TERMS = {
@@ -97,15 +129,15 @@ def _describe_error(exc: Exception, timeout: float) -> str:
     return str(exc) or type(exc).__name__
 
 
-def _is_directory_host(host: str) -> bool:
-    return any(host == d or host.endswith(f".{d}") for d in DIRECTORY_HOSTS)
+def _host_in(host: str, domains: tuple[str, ...]) -> bool:
+    return any(host == d or host.endswith(f".{d}") for d in domains)
 
 
 async def _lookup_website(company: str) -> tuple[str | None, str | None]:
     """Find a company's own website by name. Returns (domain, source URL)."""
     for doc in await tavily.search(f"{company} official website"):
         host = (urlsplit(doc.url).hostname or "").removeprefix("www.")
-        if DOMAIN_RE.match(host) and not _is_directory_host(host):
+        if DOMAIN_RE.match(host) and not _host_in(host, NON_COMPANY_HOSTS):
             return host, doc.url
     return None, None
 
@@ -217,6 +249,59 @@ def drop_unsourced(
     return result.model_copy(update=update), dropped
 
 
+def _capped_confidence(fact: Sourced, own_hosts: tuple[str, ...]) -> Confidence:
+    """High needs the company's own site, third parties reach medium, aggregators are low."""
+    host = urlsplit(fact.source_url or "").hostname or ""
+    if _host_in(host, own_hosts):
+        return fact.confidence or "low"
+    if _host_in(host, AGGREGATOR_HOSTS) or fact.confidence in (None, "low"):
+        return "low"
+    return "medium"
+
+
+def apply_confidence_rules(
+    result: ExtractionResult, own_hosts: tuple[str, ...]
+) -> ExtractionResult:
+    def capped(fact: Sourced) -> Sourced:
+        if fact.value is None:
+            return fact
+        return fact.model_copy(update={"confidence": _capped_confidence(fact, own_hosts)})
+
+    update: dict = {}
+    for field in ExtractionResult.model_fields:
+        value = getattr(result, field)
+        update[field] = [capped(fact) for fact in value] if isinstance(value, list) else capped(value)
+    return result.model_copy(update=update)
+
+
+def _date_span(text: str) -> tuple[date, date] | None:
+    """Return the first and last day a YYYY-MM-DD or YYYY-MM date could mean."""
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}", text):
+            first = date.fromisoformat(f"{text}-01")
+            last_day = calendar.monthrange(first.year, first.month)[1]
+            return first, first.replace(day=last_day)
+        day = date.fromisoformat(text)
+    except ValueError:
+        return None
+    return day, day
+
+
+def is_recent_news(item: NewsItem, today: date) -> bool:
+    """Keep only items dated within the last 12 months. No usable date means it can't be shown."""
+    span = _date_span(item.published_date or "")
+    if span is None:
+        return False
+    first, last = span
+    return last >= today - timedelta(days=365) and first <= today
+
+
+def _own_hosts(state: EnrichState) -> tuple[str, ...]:
+    urls = [state.get("homepage_url")]
+    hosts = [(urlsplit(url).hostname or "").removeprefix("www.") for url in urls if url]
+    return tuple(dict.fromkeys([state["domain"], *hosts] if state.get("domain") else hosts))
+
+
 def _merge_extractions(
     previous: ExtractionResult | None, current: ExtractionResult
 ) -> ExtractionResult:
@@ -251,6 +336,10 @@ async def extract(state: EnrichState) -> EnrichState:
         return {"errors": [f"llm: {exc}"]}
 
     result, dropped = drop_unsourced(result, sources)
+    result = apply_confidence_rules(result, _own_hosts(state))
+    today = date.today()
+    recent = [item for item in result.recent_news if is_recent_news(item, today)]
+    result = result.model_copy(update={"recent_news": recent})
     errors = [warning] if warning else []
     if dropped:
         errors.append(f"validate: dropped {dropped} fact(s) citing a URL that was not collected")

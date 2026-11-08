@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from datetime import date
 
 import pytest
 from langchain_anthropic import ChatAnthropic
@@ -131,6 +132,24 @@ async def test_sources_reach_the_prompt_as_data(settings, monkeypatch):
     assert "untrusted" in system.content
     assert "https://acme.com/" in user.content
     assert "Acme makes widgets." in user.content
+
+
+async def test_prompt_has_todays_date_and_field_rules(settings, monkeypatch):
+    calls = fake_network(monkeypatch, "gemini", [valid_response()])
+
+    await llm.extract_facts("acme.com", SOURCES)
+
+    system, user = calls[0]["messages"]
+    assert f"Today's date: {date.today().isoformat()}" in user.content
+    assert "publicly traded or was acquired" in system.content
+    assert "12 months" in system.content
+    assert "not a headcount" in system.content
+
+
+def test_employee_buckets_are_in_the_schema_sent_to_the_llm():
+    schema = json.dumps(ExtractionResult.model_json_schema())
+    assert '"5001-10000"' in schema
+    assert '"10000+"' in schema
 
 
 async def test_source_text_is_limited(settings, monkeypatch):

@@ -4,6 +4,9 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 Confidence = Literal["high", "medium", "low"]
+EmployeeBucket = Literal[
+    "1-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5001-10000", "10000+"
+]
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@([a-z0-9-]+\.)+[a-z]{2,}$", re.IGNORECASE)
 
@@ -44,18 +47,36 @@ class Sourced(BaseModel):
         return cls(value=None, source_url=None, confidence=None)
 
 
+class EmployeeRangeFact(Sourced):
+    value: EmployeeBucket | None = Field(
+        description="Bucket for a stated size range or stated total headcount. A count of "
+        "profiles, such as 'View all 158,097 employees' on LinkedIn, is not a headcount: use "
+        "a stated size range instead, or null if there is none."
+    )
+
+
+class NewsItem(Sourced):
+    published_date: str | None = Field(
+        description="Date the source gives for the item, as YYYY-MM-DD or YYYY-MM. "
+        "Null if the source gives no date."
+    )
+
+
 class ExtractionResult(BaseModel):
     """What the LLM fills in. Every field is required so null is an explicit answer."""
 
     company_name: Sourced
     website_summary: Sourced = Field(description="2-3 lines on what the company does.")
     industry: Sourced
-    employee_range: Sourced = Field(
-        description="Headcount as stated, e.g. '51-200'. Null if no source states a number."
-    )
+    employee_range: EmployeeRangeFact
     location: Sourced = Field(description="Headquarters location.")
-    funding: Sourced = Field(description="Latest round or total raised, as stated.")
-    recent_news: list[Sourced] = Field(description="Up to 5 news items, with dates if stated.")
+    funding: Sourced = Field(
+        description="Private funding rounds only (seed, Series A, etc.), as stated. Null for "
+        "public or acquired companies."
+    )
+    recent_news: list[NewsItem] = Field(
+        description="Up to 5 news items about the company itself from the last 12 months."
+    )
 
 
 class EnrichedLead(BaseModel):
@@ -67,7 +88,7 @@ class EnrichedLead(BaseModel):
     location: Sourced = Field(default_factory=Sourced.empty)
     tech_stack: list[Sourced] = []
     funding: Sourced = Field(default_factory=Sourced.empty)
-    recent_news: list[Sourced] = []
+    recent_news: list[NewsItem] = []
     is_free_email: bool
     cost_usd: float
     latency_ms: int

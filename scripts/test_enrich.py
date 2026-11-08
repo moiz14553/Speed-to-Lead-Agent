@@ -34,7 +34,8 @@ COLUMNS = [
     "http_status",
     "is_free_email",
     *[f"{field}{suffix}" for field in SINGLE_FIELDS for suffix in ("", "_source", "_confidence")],
-    *[f"{field}{suffix}" for field in LIST_FIELDS for suffix in ("", "_sources")],
+    *[f"{field}{suffix}" for field in LIST_FIELDS for suffix in ("", "_sources", "_confidences")],
+    "recent_news_dates",
     "cost_usd",
     "latency_ms",
     "errors",
@@ -56,6 +57,8 @@ def to_columns(lead: dict) -> dict:
     for field in LIST_FIELDS:
         row[field] = " | ".join(fact["value"] for fact in lead[field])
         row[f"{field}_sources"] = " | ".join(fact["source_url"] for fact in lead[field])
+        row[f"{field}_confidences"] = " | ".join(fact["confidence"] for fact in lead[field])
+    row["recent_news_dates"] = " | ".join(fact["published_date"] for fact in lead["recent_news"])
     row["errors"] = " | ".join(lead["errors"])
     return row
 
