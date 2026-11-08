@@ -12,6 +12,7 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+SCRAPE_PATHS = ("/", "/about", "/contact")
 FIRECRAWL_URL = "https://api.firecrawl.dev/v2/scrape"
 # Share of a page's timeout Firecrawl may use, leaving time for the httpx fallback.
 FIRECRAWL_TIMEOUT_SHARE = 0.6
@@ -43,6 +44,11 @@ def html_to_text(html: str) -> str:
     ]
     for tag in soup(["title", "script", "style", "noscript", "svg"]):
         tag.decompose()
+    # Footers often hold office addresses, so keep them ahead of the character limit.
+    footer = soup.find("footer")
+    if footer:
+        parts.append(footer.get_text(separator=" ", strip=True))
+        footer.decompose()
     parts.append(soup.get_text(separator=" ", strip=True))
     return "\n".join(part for part in parts if part)
 
@@ -156,14 +162,14 @@ async def _fetch_page(domain: str, path: str) -> Page | None:
 
 
 async def scrape_site(domain: str) -> tuple[list[Page], list[str]]:
-    """Fetch the homepage and /about concurrently. Returns the pages and any errors."""
+    """Fetch the homepage, /about and /contact concurrently. Returns the pages and any errors."""
     results = await asyncio.gather(
-        _fetch_page(domain, "/"), _fetch_page(domain, "/about"), return_exceptions=True
+        *(_fetch_page(domain, path) for path in SCRAPE_PATHS), return_exceptions=True
     )
 
     pages: list[Page] = []
     errors: list[str] = []
-    for path, result in zip(("/", "/about"), results):
+    for path, result in zip(SCRAPE_PATHS, results):
         if isinstance(result, Page):
             pages.append(result)
         elif isinstance(result, TimeoutError):

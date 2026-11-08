@@ -27,13 +27,15 @@ Rules:
 - Only use facts about the target company. Ignore other companies with similar names.
 - If the sources disagree about a field, give the best-supported value and set its confidence
   to low. Several offices is not a disagreement.
-- industry: use how the company's own site describes its business. Only use a third-party
-  category label, such as LinkedIn's, if the company's own site does not say.
-- location: the headquarters first. Add other offices only if the company's own site lists them.
-- employee_range must be one of the allowed buckets. Use a stated size range or a stated total
-  headcount. A count of profiles or followers on a site like LinkedIn is not a headcount.
-- funding is for private funding rounds only (seed, Series A, etc.). If the sources say the
-  company is publicly traded or was acquired, set funding to null and say so in website_summary.
+- own_site_industry: a short phrase for what the company sells, taken from its own site.
+  third_party_industry: a category given by a third party, such as LinkedIn's label.
+- location: the headquarters first, at most 3 entries. Prefer the company's own contact page,
+  about page or footer. Ignore lists of branch addresses in annual reports.
+- employee_count: copy the headcount text as stated. A count of profiles or followers on a
+  site like LinkedIn is not a headcount.
+- ownership: private, public or acquired, only if the sources say so. Give acquired_by if stated.
+- website_summary: only what the company does. Never who owns it, stock listings or acquisitions.
+- funding: private funding rounds only (seed, Series A, etc.).
 - recent_news only has items from the 12 months before today's date, each with its date, and
   only about the company itself. Leave out news about companies it invested in, partners'
   announcements that are mainly about the partner, and items with no date in the source.
@@ -65,6 +67,7 @@ def build_chat_model(settings: Settings) -> BaseChatModel:
             max_tokens=MAX_OUTPUT_TOKENS,
             timeout=settings.llm_timeout_seconds,
             max_retries=1,
+            temperature=0,
         )
     if settings.anthropic_api_key is None:
         raise LLMError("ANTHROPIC_API_KEY is not set")

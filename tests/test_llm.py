@@ -141,18 +141,44 @@ async def test_prompt_has_todays_date_and_field_rules(settings, monkeypatch):
 
     system, user = calls[0]["messages"]
     assert f"Today's date: {date.today().isoformat()}" in user.content
-    assert "publicly traded or was acquired" in system.content
     assert "12 months" in system.content
     assert "not a headcount" in system.content
     assert "disagree" in system.content
-    assert "category label" in system.content
-    assert "other offices" in system.content
+    assert "own_site_industry" in system.content
+    assert "annual reports" in system.content
+    assert "Never who owns it" in system.content
 
 
-def test_employee_buckets_are_in_the_schema_sent_to_the_llm():
-    schema = json.dumps(ExtractionResult.model_json_schema())
-    assert '"5001-10000"' in schema
-    assert '"10000+"' in schema
+def test_llm_schema_asks_for_raw_headcount_and_ownership():
+    schema = ExtractionResult.model_json_schema()
+    assert "employee_count" in schema["properties"]
+    assert "employee_range" not in schema["properties"]
+    assert '"acquired"' in json.dumps(schema)
+
+
+def test_gemini_temperature_is_zero(settings):
+    assert llm.build_chat_model(settings).temperature == 0
+
+
+async def test_gemini_request_sends_temperature_zero(settings, monkeypatch):
+    model = llm.build_chat_model(settings)
+    captured = {}
+
+    async def generate(**kwargs):
+        captured.update(kwargs)
+        raise ModelInvalidRequestError("stop here")
+
+    monkeypatch.setattr(model.client.aio.models, "generate_content", generate)
+
+    with pytest.raises(ModelInvalidRequestError):
+        await model.ainvoke([("user", "hi")])
+
+    assert captured["config"].temperature == 0
+
+
+def test_anthropic_does_not_send_temperature(settings):
+    settings.llm_provider = "anthropic"
+    assert llm.build_chat_model(settings).temperature is None
 
 
 async def test_source_text_is_limited(settings, monkeypatch):

@@ -4,9 +4,6 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 Confidence = Literal["high", "medium", "low"]
-EmployeeBucket = Literal[
-    "1-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5001-10000", "10000+"
-]
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@([a-z0-9-]+\.)+[a-z]{2,}$", re.IGNORECASE)
 
@@ -47,12 +44,11 @@ class Sourced(BaseModel):
         return cls(value=None, source_url=None, confidence=None)
 
 
-class EmployeeRangeFact(Sourced):
-    value: EmployeeBucket | None = Field(
-        description="Bucket for a stated size range or stated total headcount. A count of "
-        "profiles, such as 'View all 158,097 employees' on LinkedIn, is not a headcount: use "
-        "a stated size range instead, or null if there is none."
+class OwnershipFact(Sourced):
+    value: Literal["private", "public", "acquired"] | None = Field(
+        description="Ownership as stated in the sources, or null if they do not say."
     )
+    acquired_by: str | None = Field(description="The acquiring company, if acquired and stated.")
 
 
 class NewsItem(Sourced):
@@ -66,16 +62,20 @@ class ExtractionResult(BaseModel):
     """What the LLM fills in. Every field is required so null is an explicit answer."""
 
     company_name: Sourced
-    website_summary: Sourced = Field(description="2-3 lines on what the company does.")
-    industry: Sourced = Field(description="From the company's own site when it says.")
-    employee_range: EmployeeRangeFact
-    location: list[Sourced] = Field(
-        description="Headquarters first. Add other offices only if the company's own site lists them."
+    website_summary: Sourced = Field(
+        description="2-3 lines on what the company does. Nothing about who owns it."
     )
-    funding: Sourced = Field(
-        description="Private funding rounds only (seed, Series A, etc.), as stated. Null for "
-        "public or acquired companies."
+    own_site_industry: Sourced = Field(
+        description="Short phrase for what the company sells, from its own site. Null if its "
+        "own site does not say."
     )
+    third_party_industry: Sourced = Field(description="Industry category from a third party.")
+    employee_count: Sourced = Field(
+        description="Headcount text exactly as stated, e.g. '120' or '1,001-5,000 employees'."
+    )
+    location: list[Sourced] = Field(description="Headquarters first, then up to 2 other offices.")
+    ownership: OwnershipFact
+    funding: Sourced = Field(description="Private funding rounds (seed, Series A, etc.), as stated.")
     recent_news: list[NewsItem] = Field(
         description="Up to 5 news items about the company itself from the last 12 months."
     )
@@ -88,6 +88,7 @@ class EnrichedLead(BaseModel):
     industry: Sourced = Field(default_factory=Sourced.empty)
     employee_range: Sourced = Field(default_factory=Sourced.empty)
     location: list[Sourced] = []
+    ownership: Sourced = Field(default_factory=Sourced.empty)
     tech_stack: list[Sourced] = []
     funding: Sourced = Field(default_factory=Sourced.empty)
     recent_news: list[NewsItem] = []

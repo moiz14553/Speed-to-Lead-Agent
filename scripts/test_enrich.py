@@ -20,6 +20,7 @@ SINGLE_FIELDS = [
     "website_summary",
     "industry",
     "employee_range",
+    "ownership",
     "funding",
 ]
 LIST_FIELDS = ["location", "tech_stack", "recent_news"]

@@ -17,6 +17,7 @@ from app.models.enrichment import (
     EnrichRequest,
     ExtractionResult,
     NewsItem,
+    OwnershipFact,
     Sourced,
     SourceDoc,
 )
@@ -84,6 +85,29 @@ COMPANY_NAME_NOISE = {
     "group",
     "holdings",
 }
+EMPLOYEE_BUCKETS = (
+    (10, "1-10"),
+    (50, "11-50"),
+    (200, "51-200"),
+    (500, "201-500"),
+    (1000, "501-1000"),
+    (5000, "1001-5000"),
+    (10000, "5001-10000"),
+)
+_COUNT = r"(\d[\d,]*(?:\.\d+)?)\s*(?:(k|m|thousand|million)\b)?"
+_COUNT_RANGE_RE = re.compile(rf"{_COUNT}\s*(?:-|\u2013|\u2014|to)\s*{_COUNT}")
+_COUNT_RE = re.compile(_COUNT)
+_ABOVE_RE = re.compile(r"\b(over|more than|above)\b")
+_PROFILE_COUNT_RE = re.compile(r"follower|profile|on linkedin|linkedin member|associated member")
+_UNIT_MULTIPLIERS = {"k": 1_000, "thousand": 1_000, "m": 1_000_000, "million": 1_000_000}
+_OWNERSHIP_TEXT_RE = re.compile(
+    r"publicly[- ](traded|listed|held)|public company|privately[- ](held|owned)|private company"
+    r"|acquired by|was acquired|acquisition by|subsidiary of|owned by|nasdaq|nyse|stock exchange",
+    re.IGNORECASE,
+)
+_REPORT_URL_RE = re.compile(r"\.pdf($|\?)|annual[-_ ]?(%20)?report")
+MAX_LOCATIONS = 3
+LOOKUP_MAX_RESULTS = 10
 DOMAIN_SUFFIX_LABELS = {"com", "co", "org", "net", "io", "ai", "app", "biz", "info"}
 KEY_FIELDS = ("industry", "employee_range")
 TARGETED_QUERY_TERMS = {
@@ -152,8 +176,12 @@ def _site_label(host: str) -> str:
     return labels[-1].replace("-", "")
 
 
+def _company_tokens(company: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", company.lower()) if t not in COMPANY_NAME_NOISE]
+
+
 def domain_matches_company(host: str, company: str) -> bool:
-    tokens = [t for t in re.findall(r"[a-z0-9]+", company.lower()) if t not in COMPANY_NAME_NOISE]
+    tokens = _company_tokens(company)
     if not tokens:
         return False
     label = _site_label(host)
@@ -168,15 +196,21 @@ def domain_matches_company(host: str, company: str) -> bool:
 
 async def _lookup_website(company: str) -> tuple[str | None, str | None]:
     """Find a company's own website by name. Returns (domain, source URL), or nulls if none fits."""
-    for doc in await tavily.search(f"{company} official website"):
+    best: tuple[tuple[bool, bool, int], str, str] | None = None
+    name = "".join(_company_tokens(company))
+    for doc in await tavily.search(f"{company} official website", max_results=LOOKUP_MAX_RESULTS):
         host = (urlsplit(doc.url).hostname or "").removeprefix("www.")
         if (
-            DOMAIN_RE.match(host)
-            and not _host_in(host, SEARCH_PROVIDER_HOSTS)
-            and domain_matches_company(host, company)
+            not DOMAIN_RE.match(host)
+            or _host_in(host, SEARCH_PROVIDER_HOSTS)
+            or not domain_matches_company(host, company)
         ):
-            return host, doc.url
-    return None, None
+            continue
+        # stripe.com beats stripe.dev, which beats stripepayments.com. First result wins ties.
+        score = (_site_label(host) == name, host.endswith(".com"), -host.count("."))
+        if best is None or score > best[0]:
+            best = (score, host, doc.url)
+    return (best[1], best[2]) if best else (None, None)
 
 
 async def resolve_domain(state: EnrichState) -> EnrichState:
@@ -281,7 +315,9 @@ def drop_unsourced(
             update[field] = [fact for fact in found if is_sourced(fact)]
             dropped += len(found) - len(update[field])
         elif value.value is not None and not is_sourced(value):
-            update[field] = Sourced.empty()
+            update[field] = value.model_copy(
+                update={"value": None, "source_url": None, "confidence": None}
+            )
             dropped += 1
     return result.model_copy(update=update), dropped
 
@@ -315,12 +351,70 @@ def apply_confidence_rules(
     return result.model_copy(update=update)
 
 
-def keep_listed_offices(result: ExtractionResult, own_hosts: tuple[str, ...]) -> ExtractionResult:
-    """Several locations are only allowed when the company's own site lists them."""
-    if len(result.location) <= 1:
-        return result
-    own = [fact for fact in result.location if _host_in(_source_host(fact), own_hosts)]
-    return result.model_copy(update={"location": own if len(own) >= 2 else result.location[:1]})
+def _pick_locations(locations: list[Sourced], own_hosts: tuple[str, ...]) -> list[Sourced]:
+    """Use the company's own site if it gives any, otherwise only the first location."""
+    usable = [f for f in locations if not _REPORT_URL_RE.search((f.source_url or "").lower())]
+    own = [fact for fact in usable if _host_in(_source_host(fact), own_hosts)]
+    return own[:MAX_LOCATIONS] if own else usable[:1]
+
+
+def _count_value(number: str, unit: str | None) -> float:
+    return float(number.replace(",", "")) * _UNIT_MULTIPLIERS.get(unit or "", 1)
+
+
+def employee_bucket(raw: str | None) -> str | None:
+    """Map headcount text such as '120' or '1,001-5,000 employees' to a fixed bucket."""
+    text = (raw or "").lower()
+    if not text or _PROFILE_COUNT_RE.search(text):
+        return None
+
+    if match := _COUNT_RANGE_RE.search(text):
+        low_number, low_unit, high_number, high_unit = match.groups()
+        high = _count_value(high_number, high_unit)
+        count = (_count_value(low_number, low_unit or high_unit) + high) / 2
+    elif match := _COUNT_RE.search(text):
+        count = _count_value(match.group(1), match.group(2))
+        if text[match.end() :].lstrip().startswith("+") or _ABOVE_RE.search(text):
+            count += 1
+    else:
+        return None
+
+    if count <= 0:
+        return None
+    return next((bucket for limit, bucket in EMPLOYEE_BUCKETS if count <= limit), "10000+")
+
+
+def _without_ownership_text(summary: Sourced) -> Sourced:
+    """Drop sentences about ownership. The ownership field carries that fact."""
+    if summary.value is None:
+        return summary
+    sentences = re.split(r"(?<=[.!?])\s+", summary.value)
+    kept = " ".join(s for s in sentences if not _OWNERSHIP_TEXT_RE.search(s))
+    return summary.model_copy(update={"value": kept}) if kept else Sourced.empty()
+
+
+def apply_field_rules(result: ExtractionResult, own_hosts: tuple[str, ...]) -> ExtractionResult:
+    update: dict = {
+        "website_summary": _without_ownership_text(result.website_summary),
+        "location": _pick_locations(result.location, own_hosts),
+        "recent_news": [item for item in result.recent_news if is_recent_news(item, date.today())],
+    }
+    if employee_bucket(result.employee_count.value) is None:
+        update["employee_count"] = Sourced.empty()
+
+    # "Own site" has to be true of the URL, not just the field the LLM put it in.
+    own_industry = result.own_site_industry
+    if own_industry.value is not None and not _host_in(_source_host(own_industry), own_hosts):
+        update["own_site_industry"] = Sourced.empty()
+        if result.third_party_industry.value is None:
+            update["third_party_industry"] = own_industry
+    return result.model_copy(update=update)
+
+
+def _clear_funding_unless_private(result: ExtractionResult) -> ExtractionResult:
+    if result.ownership.value in ("public", "acquired"):
+        return result.model_copy(update={"funding": Sourced.empty()})
+    return result
 
 
 def _date_span(text: str) -> tuple[date, date] | None:
@@ -386,29 +480,32 @@ async def extract(state: EnrichState) -> EnrichState:
 
     result, dropped = drop_unsourced(result, sources)
     own_hosts = _own_hosts(state)
-    result = keep_listed_offices(apply_confidence_rules(result, own_hosts), own_hosts)
-    today = date.today()
-    recent = [item for item in result.recent_news if is_recent_news(item, today)]
-    result = result.model_copy(update={"recent_news": recent})
+    result = apply_field_rules(apply_confidence_rules(result, own_hosts), own_hosts)
     errors = [warning] if warning else []
     if dropped:
         errors.append(f"validate: dropped {dropped} fact(s) citing a URL that was not collected")
     return {
-        "extraction": _merge_extractions(previous, result),
+        "extraction": _clear_funding_unless_private(_merge_extractions(previous, result)),
         "cost_usd": cost,
         "errors": errors,
     }
 
 
+def _resolved_industry(extraction: ExtractionResult) -> Sourced:
+    """The company's own description wins over a third party's category."""
+    own = extraction.own_site_industry
+    return own if own.value else extraction.third_party_industry
+
+
 async def validate(state: EnrichState) -> EnrichState:
     extraction = state.get("extraction")
-    return {
-        "missing_fields": [
-            field
-            for field in KEY_FIELDS
-            if extraction is None or getattr(extraction, field).value is None
-        ]
+    if extraction is None:
+        return {"missing_fields": list(KEY_FIELDS)}
+    values = {
+        "industry": _resolved_industry(extraction).value,
+        "employee_range": extraction.employee_count.value,
     }
+    return {"missing_fields": [field for field in KEY_FIELDS if values[field] is None]}
 
 
 async def targeted_search(state: EnrichState) -> EnrichState:
@@ -473,11 +570,37 @@ def _domain_fact(state: EnrichState) -> Sourced:
     )
 
 
+def _ownership_fact(ownership: OwnershipFact) -> Sourced:
+    value = ownership.value
+    if value == "acquired":
+        value = f"acquired_by: {ownership.acquired_by or 'unknown'}"
+    return Sourced(value=value, source_url=ownership.source_url, confidence=ownership.confidence)
+
+
+def _lead_fields(extraction: ExtractionResult | None) -> dict:
+    """Turn what the LLM extracted into the fields the API returns."""
+    if extraction is None:
+        return {}
+    count = extraction.employee_count
+    return {
+        **extraction.model_dump(
+            exclude={"own_site_industry", "third_party_industry", "employee_count", "ownership"}
+        ),
+        "industry": _resolved_industry(extraction),
+        "employee_range": Sourced(
+            value=employee_bucket(count.value),
+            source_url=count.source_url,
+            confidence=count.confidence,
+        ),
+        "ownership": _ownership_fact(extraction.ownership),
+    }
+
+
 def _build_lead(state: EnrichState, is_free: bool, latency_ms: int) -> EnrichedLead:
     settings = get_settings()
     extraction = state.get("extraction")
     return EnrichedLead(
-        **(extraction.model_dump() if extraction else {}),
+        **_lead_fields(extraction),
         domain=_domain_fact(state),
         tech_stack=state["tech_stack"],
         is_free_email=is_free,

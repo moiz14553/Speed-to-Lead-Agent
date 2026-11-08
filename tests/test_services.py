@@ -66,6 +66,13 @@ def test_html_to_text_keeps_title_and_description_and_drops_scripts():
     assert "secret" not in text
 
 
+def test_html_to_text_puts_footer_before_the_body():
+    html = "<body><p>Long body</p><footer>Milton, Canada</footer></body>"
+    text = scraper.html_to_text(html)
+    assert text.index("Milton") < text.index("Long body")
+    assert text.count("Milton") == 1
+
+
 def _fake_addrinfo(address: str):
     async def getaddrinfo(self, host, port, **kwargs):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
@@ -120,14 +127,18 @@ async def test_scrape_fetches_homepage_and_about(monkeypatch, public_hosts):
 
     pages, errors = await scraper.scrape_site("acme.com")
 
-    assert sorted(page.url for page in pages) == ["https://acme.com/", "https://acme.com/about"]
+    assert sorted(page.url for page in pages) == [
+        "https://acme.com/",
+        "https://acme.com/about",
+        "https://acme.com/contact",
+    ]
     assert pages[0].url == "https://acme.com/"
     assert errors == []
 
 
 async def test_missing_about_page_is_not_an_error(monkeypatch, public_hosts):
     def handler(request):
-        if request.url.path == "/about":
+        if request.url.path != "/":
             return httpx.Response(404)
         return httpx.Response(200, html="<title>Home</title>")
 
@@ -145,7 +156,7 @@ async def test_blocked_homepage_is_reported(monkeypatch, public_hosts):
     pages, errors = await scraper.scrape_site("acme.com")
 
     assert pages == []
-    assert len(errors) == 2
+    assert len(errors) == 3
     assert errors[0] == "scrape /: HTTP 403"
 
 
@@ -158,7 +169,7 @@ async def test_scrape_429_is_retried_once_and_succeeds(monkeypatch, public_hosts
     calls = []
 
     def handler(request):
-        if request.url.path == "/about":
+        if request.url.path != "/":
             return httpx.Response(404)
         calls.append(request)
         if len(calls) == 1:
@@ -179,7 +190,7 @@ async def test_scrape_429_twice_is_reported_after_one_retry(monkeypatch, public_
     calls = []
 
     def handler(request):
-        if request.url.path == "/about":
+        if request.url.path != "/":
             return httpx.Response(404)
         calls.append(request)
         return httpx.Response(429)
@@ -197,7 +208,7 @@ async def test_scrape_429_with_long_retry_after_is_not_retried(monkeypatch, publ
     calls = []
 
     def handler(request):
-        if request.url.path == "/about":
+        if request.url.path != "/":
             return httpx.Response(404)
         calls.append(request)
         return httpx.Response(429, headers={"retry-after": "60"})
@@ -221,7 +232,7 @@ async def test_scrape_403_is_not_retried(monkeypatch, public_hosts):
 
     await scraper.scrape_site("acme.com")
 
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 async def test_redirect_to_private_host_is_blocked(monkeypatch, public_hosts):

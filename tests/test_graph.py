@@ -8,12 +8,13 @@ from pydantic import ValidationError
 from app.agents.enrichment import (
     domain_matches_company,
     drop_unsourced,
+    employee_bucket,
     is_free_email,
     is_recent_news,
     parse_domain,
     run_enrichment,
 )
-from app.models.enrichment import EmployeeRangeFact, EnrichRequest, Sourced, SourceDoc
+from app.models.enrichment import EnrichRequest, OwnershipFact, Sourced, SourceDoc
 from app.services import scraper, tavily
 from app.services.llm import LLMError, LLMTimeoutError, LLMWaitTooLongError
 from tests.conftest import HOMEPAGE, SEARCH_URL, fact, full_extraction, news
@@ -25,7 +26,11 @@ def request(email="jo@acme.com", hint=None) -> EnrichRequest:
 
 def without_key_fields():
     return full_extraction().model_copy(
-        update={"industry": Sourced.empty(), "employee_range": Sourced.empty()}
+        update={
+            "own_site_industry": Sourced.empty(),
+            "third_party_industry": Sourced.empty(),
+            "employee_count": Sourced.empty(),
+        }
     )
 
 
@@ -264,7 +269,7 @@ async def test_no_sources_skips_llm_and_returns_nulls(external, monkeypatch):
 def test_drop_unsourced_removes_invented_urls():
     extraction = full_extraction().model_copy(
         update={
-            "industry": fact("Made up", "https://invented.example/"),
+            "own_site_industry": fact("Made up", "https://invented.example/"),
             "recent_news": [
                 news("Real", SEARCH_URL),
                 news("Fake", "https://invented.example/news"),
@@ -276,7 +281,7 @@ def test_drop_unsourced_removes_invented_urls():
     cleaned, dropped = drop_unsourced(extraction, sources)
 
     assert dropped == 2
-    assert cleaned.industry == Sourced.empty()
+    assert cleaned.own_site_industry == Sourced.empty()
     assert [item.value for item in cleaned.recent_news] == ["Real"]
     assert cleaned.company_name.value == "Acme"
 
@@ -338,7 +343,9 @@ async def test_news_confidence_is_capped_too(external):
 async def test_low_confidence_for_disagreeing_sources_is_kept_on_own_site(external):
     external.llm_results = [
         full_extraction().model_copy(
-            update={"industry": Sourced(value="Widgets", source_url=HOMEPAGE, confidence="low")}
+            update={
+                "own_site_industry": Sourced(value="Widgets", source_url=HOMEPAGE, confidence="low")
+            }
         )
     ]
 
@@ -356,6 +363,53 @@ async def test_several_offices_are_kept_when_own_site_lists_them(external):
 
     assert [office.value for office in lead.location] == ["Milton", "Karachi"]
     assert all(office.confidence == "high" for office in lead.location)
+
+
+async def test_at_most_three_locations(external):
+    offices = [fact(city) for city in ("Toronto", "Karachi", "Lahore", "Dubai", "London")]
+    external.llm_results = [full_extraction().model_copy(update={"location": offices})]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Toronto", "Karachi", "Lahore"]
+
+
+@pytest.mark.parametrize(
+    "report_url",
+    [
+        "https://acme.com/files/Annual%20Report%202025.pdf",
+        "https://acme.com/files/report.pdf",
+        "https://acme.com/investors/annual-report/offices",
+    ],
+)
+async def test_annual_report_branch_lists_are_ignored(external, monkeypatch, report_url):
+    async def search(query, max_results=5):
+        return [SourceDoc(url=report_url, text="Branch offices")]
+
+    monkeypatch.setattr(tavily, "search", search)
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={
+                "location": [fact("Multan branch", report_url), fact("Toronto"), fact("Lahore")]
+            }
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Toronto", "Lahore"]
+
+
+async def test_own_site_location_preferred_over_third_party(external):
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={"location": [fact("Wrong City", SEARCH_URL), fact("Toronto")]}
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert [office.value for office in lead.location] == ["Toronto"]
 
 
 async def test_only_first_location_kept_when_not_from_own_site(external):
@@ -392,6 +446,39 @@ def test_domain_matches_company(host, company, expected):
     assert domain_matches_company(host, company) is expected
 
 
+async def test_lookup_finds_exact_match_past_other_results(external, monkeypatch):
+    async def search(query, max_results=5):
+        if "official website" not in query:
+            return []
+        assert max_results == 10
+        return [
+            SourceDoc(url="https://tavily.com/knowledge/company/abc", text="Stripe"),
+            SourceDoc(url="https://financer.com/stripe", text="Stripe review"),
+            SourceDoc(url="https://stripepayments.com/", text="Stripe"),
+            SourceDoc(url="https://stripe.dev/", text="Stripe developers"),
+            SourceDoc(url="https://docs.stripe.com/", text="Stripe docs"),
+            SourceDoc(url="https://stripe.com/", text="Stripe"),
+        ]
+
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Stripe"))
+
+    assert lead.domain.value == "stripe.com"
+    assert external.scraped_domains == ["stripe.com"]
+
+
+async def test_lookup_falls_back_to_a_partial_name_match(external, monkeypatch):
+    async def search(query, max_results=5):
+        return [SourceDoc(url="https://acmewidgets.io/", text="Acme")]
+
+    monkeypatch.setattr(tavily, "search", search)
+
+    lead = await run_enrichment(request("jo@gmail.com", "Acme"))
+
+    assert lead.domain.value == "acmewidgets.io"
+
+
 async def test_lookup_returns_null_when_no_site_matches_the_name(external, monkeypatch):
     async def search(query, max_results=5):
         return [SourceDoc(url="https://financer.com/stripe", text="Stripe review")]
@@ -405,16 +492,203 @@ async def test_lookup_returns_null_when_no_site_matches_the_name(external, monke
 
 
 @pytest.mark.parametrize(
-    "bucket", ["1-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5001-10000", "10000+"]
+    "raw,expected",
+    [
+        ("120", "51-200"),
+        ("120 employees", "51-200"),
+        ("5", "1-10"),
+        ("10", "1-10"),
+        ("11", "11-50"),
+        ("50", "11-50"),
+        ("51", "51-200"),
+        ("200", "51-200"),
+        ("201", "201-500"),
+        ("500", "201-500"),
+        ("501", "501-1000"),
+        ("1000", "501-1000"),
+        ("1001", "1001-5000"),
+        ("5000", "1001-5000"),
+        ("5001", "5001-10000"),
+        ("10000", "5001-10000"),
+        ("10001", "10000+"),
+        ("13,651", "10000+"),
+        ("228,000 employees", "10000+"),
+        ("about 75 people", "51-200"),
+        ("2.5k", "1001-5000"),
+        ("1.2 million", "10000+"),
+        ("51-200", "51-200"),
+        ("1,001-5,000 employees", "1001-5000"),
+        ("5,001 to 10,000", "5001-10000"),
+        ("201 \u2013 500", "201-500"),
+        ("1k-5k", "1001-5000"),
+        ("5-10k", "5001-10000"),
+        ("10,001+", "10000+"),
+        ("10000+", "10000+"),
+        ("10,000+ employees", "10000+"),
+        ("200+", "201-500"),
+        ("over 200", "201-500"),
+        ("View all 158,097 employees on LinkedIn", None),
+        ("158k followers", None),
+        ("unknown", None),
+        ("hundreds", None),
+        ("0", None),
+        ("", None),
+        (None, None),
+    ],
 )
-def test_employee_buckets_are_accepted(bucket):
-    assert EmployeeRangeFact(value=bucket, source_url=HOMEPAGE, confidence="low").value == bucket
+def test_employee_bucket_mapping(raw, expected):
+    assert employee_bucket(raw) == expected
 
 
-@pytest.mark.parametrize("value", ["158,337", "5", "5,001 to 10,000", "10,001+", "13651"])
-def test_other_employee_values_are_rejected(value):
-    with pytest.raises(ValidationError):
-        EmployeeRangeFact(value=value, source_url=HOMEPAGE, confidence="low")
+async def test_llm_headcount_is_mapped_to_a_bucket_with_its_source(external):
+    external.llm_results = [
+        full_extraction().model_copy(update={"employee_count": fact("1,500 staff", SEARCH_URL)})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.employee_range.value == "1001-5000"
+    assert lead.employee_range.source_url == SEARCH_URL
+
+
+async def test_unmappable_headcount_is_null_and_triggers_the_retry(external):
+    external.llm_results = [
+        full_extraction().model_copy(update={"employee_count": fact("a lot of people")}),
+        full_extraction(),
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert external.llm_calls == 2
+    assert lead.employee_range.value == "51-200"
+
+
+def _ownership(value, acquired_by=None, url=SEARCH_URL):
+    return OwnershipFact(value=value, acquired_by=acquired_by, source_url=url, confidence="medium")
+
+
+@pytest.mark.parametrize(
+    "value,acquired_by,expected",
+    [
+        ("private", None, "private"),
+        ("public", None, "public"),
+        ("acquired", "Coty", "acquired_by: Coty"),
+        ("acquired", None, "acquired_by: unknown"),
+    ],
+)
+async def test_ownership_field(external, value, acquired_by, expected):
+    external.llm_results = [
+        full_extraction().model_copy(update={"ownership": _ownership(value, acquired_by)})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.ownership.value == expected
+    assert lead.ownership.source_url == SEARCH_URL
+
+
+@pytest.mark.parametrize("value", ["public", "acquired"])
+async def test_public_or_acquired_clears_funding(external, value):
+    external.llm_results = [
+        full_extraction().model_copy(update={"ownership": _ownership(value, "Alibaba")})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.funding.value is None
+
+
+@pytest.mark.parametrize("value", ["private", None])
+async def test_funding_kept_unless_public_or_acquired(external, value):
+    external.llm_results = [
+        full_extraction().model_copy(update={"ownership": _ownership(value)})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.funding.value == "Series A"
+
+
+async def test_funding_cleared_when_only_the_first_extraction_found_ownership(external):
+    first = full_extraction().model_copy(
+        update={
+            "ownership": _ownership("public"),
+            "own_site_industry": Sourced.empty(),
+            "funding": Sourced.empty(),
+        }
+    )
+    second = full_extraction().model_copy(update={"ownership": _ownership(None)})
+    external.llm_results = [first, second]
+
+    lead = await run_enrichment(request())
+
+    assert lead.ownership.value == "public"
+    assert lead.funding.value is None
+
+
+@pytest.mark.parametrize(
+    "summary,expected",
+    [
+        ("Acme makes widgets. It was acquired by Coty in 2019.", "Acme makes widgets."),
+        ("Acme makes widgets. Note: The company is publicly traded.", "Acme makes widgets."),
+        ("Acme makes widgets. Listed on NASDAQ (ACME).", "Acme makes widgets."),
+        ("Acme makes widgets. It sells them online.", "Acme makes widgets. It sells them online."),
+        ("Acme is a publicly traded company.", None),
+    ],
+)
+async def test_ownership_is_removed_from_summary(external, summary, expected):
+    external.llm_results = [
+        full_extraction().model_copy(update={"website_summary": fact(summary)})
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.website_summary.value == expected
+
+
+async def test_own_site_industry_beats_third_party_label(external):
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={
+                "own_site_industry": fact("Online marketplace"),
+                "third_party_industry": fact("Software Development", "https://www.linkedin.com/x"),
+            }
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.industry.value == "Online marketplace"
+
+
+async def test_third_party_industry_used_when_own_site_has_none(external):
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={
+                "own_site_industry": Sourced.empty(),
+                "third_party_industry": fact("Retail", SEARCH_URL),
+            }
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.industry.value == "Retail"
+
+
+async def test_own_site_industry_from_another_site_is_not_treated_as_own(external):
+    external.llm_results = [
+        full_extraction().model_copy(
+            update={
+                "own_site_industry": fact("Claimed", SEARCH_URL),
+                "third_party_industry": fact("Other label", SEARCH_URL),
+            }
+        )
+    ]
+
+    lead = await run_enrichment(request())
+
+    assert lead.industry.value == "Other label"
 
 
 TODAY = date(2026, 11, 8)
